@@ -13,4 +13,6 @@ dependencies = [
     "pyscf>=2.10.0",
     "pysmiles>=2.0.0",
     "rdkit>=2025.3.5",
+    "torch>=2.8.0",
+    "torch-geometric>=2.6.1",
 ]
