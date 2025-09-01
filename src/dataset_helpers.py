@@ -1,10 +1,11 @@
 # https://github.com/mcunow/graph-matching/blob/main/README.md
 import torch
 import torch.nn as nn
-from torch_geometric.data import Data, Batch
+from torch_geometric.data import Data, Batch, Dataset
 from rdkit import Chem
 from functools import cache
 import os
+from typing import List, Optional
 
 BOND_TENSOR_DICT = {
     Chem.BondType.SINGLE:torch.tensor([1,0,0,0]),
@@ -142,6 +143,7 @@ def create_edge_features(mol):
         edge = BOND_TENSOR_DICT[bond.GetBondType()]
 
         edge_attr_prelist.append(edge)
+        edge_attr_prelist.append(edge)
 
     if len(edges) <= 1:
         edge_index = torch.empty((2,0), dtype=torch.long)
@@ -156,25 +158,27 @@ def create_edge_features(mol):
     return (edge_index, edge_attr)
 
 
-def smiles_to_graph_data(smiles):
+def smiles_to_graph_data(smiles, output):
     mol = Chem.MolFromSmiles(smiles)
     if mol is None:
         raise ValueError(f"Invalid SMILES string: {smiles}")
+    
     
     node_features=create_node_features(mol)
     edge_index, edge_attr = create_edge_features(mol)
     data = Data(
         x = node_features,
         edge_index = edge_index,
-        edge_attr = edge_attr
+        edge_attr = edge_attr,
+        y=output
     )
 
     return data
 
-def smiles_iter_to_graph_dataset(smiles_iter):
+def smiles_iter_to_graph_dataset(smiles_iter, y):
     dataset = []
-    for smiles in smiles_iter:
-        dataset.append(smiles_to_graph_data(smiles))
+    for smiles, output in zip(smiles_iter, y):
+        dataset.append(smiles_to_graph_data(smiles, output))
     
     return dataset
 

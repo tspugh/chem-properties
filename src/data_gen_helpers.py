@@ -1,4 +1,4 @@
-from typing import Optional, List, Set, AsyncGenerator, Union
+from typing import Optional, List, Set, AsyncGenerator, Union, Generator
 from pysmiles import read_smiles, write_smiles
 from rdkit import Chem
 import asyncio
@@ -73,11 +73,11 @@ def connect_smiles_graphwise(frag_1_smiles: str, frag_2_smiles: str) -> str:
     return output
 
 
-async def iterative_extend_smiles(
+def iterative_extend_smiles(
     smiles: str,
     max_length: int = 150,
     max_output: Optional[int] = None
-) -> AsyncGenerator[str, None]:
+) -> Generator[str, None, None]:
     """Asynchronously yield new SMILES strings by iteratively extending fragments at '*' positions.
        Avoids duplicates and handles fragment symmetries.
     """
@@ -100,7 +100,7 @@ async def iterative_extend_smiles(
 
     visited: Set[str] = set()
 
-    async def helper(current_smiles: str, depth_left: int) -> AsyncGenerator[str, None]:
+    def helper(current_smiles: str, depth_left: int) -> Generator[str, None, None]:
         if depth_left == 0:
             yield current_smiles
             return
@@ -114,22 +114,12 @@ async def iterative_extend_smiles(
                     yield can_s  # yield immediately instead of collecting in a list
                     if max_output and len(visited) >= max_output:
                         return
-                    async for res in helper(can_s, depth_left - 1):
+                    for res in helper(can_s, depth_left - 1):
                         yield res
                         if max_output and len(visited) >= max_output:
                             return
 
     start = Chem.MolToSmiles(Chem.MolFromSmiles(smiles))
     visited.add(start)
-    async for result in helper(start, max_length // frag_length):
+    for result in helper(start, max_length // frag_length):
         yield result
-
-def iterative_extend_smiles_sync(
-    smiles: str,
-    max_length: int = 150,
-    max_output: Optional[int] = None
-) -> List[str]:
-    """Generate new SMILES strings by iteratively extending fragments at '*' positions.
-       Avoids duplicates and handles fragment symmetries.
-    """
-    return list(asyncio.run(iterative_extend_smiles(smiles, max_length, max_output)))
