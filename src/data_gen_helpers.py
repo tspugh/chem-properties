@@ -115,8 +115,8 @@ def iterative_extend_smiles(
                     yield (can_s, max_chain_extend-depth_left+1)  # yield immediately instead of collecting in a list
                     if max_output and len(visited) >= max_output:
                         return
-                    for res, _ in helper(can_s, depth_left - 1):
-                        yield res
+                    for res, dep in helper(can_s, depth_left - 1):
+                        yield res, dep
                         if max_output and len(visited) >= max_output:
                             return
 

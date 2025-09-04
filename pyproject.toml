@@ -5,10 +5,14 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "cutensor-cu12>=2.3.0",
     "geometric>=1.1",
+    "gpu4pyscf-cuda12x>=1.4.3",
     "ipykernel>=6.30.1",
+    "ipython>=9.5.0",
     "kaggle>=1.7.4.5",
     "matplotlib>=3.10.5",
+    "multiprocessing-logging>=0.3.4",
     "networkx>=3.5",
     "pandas>=2.3.2",
     "pyscf>=2.10.0",
@@ -17,4 +21,5 @@ dependencies = [
     "rdkit>=2025.3.5",
     "torch>=2.8.0",
     "torch-geometric>=2.6.1",
+    "cuda-python<12.3",
 ]

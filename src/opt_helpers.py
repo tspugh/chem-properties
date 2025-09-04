@@ -3,11 +3,14 @@ from rdkit.Chem import rdDistGeom
 from rdkit.Chem.rdForceFieldHelpers import MMFFOptimizeMolecule
 from pyscf import gto, scf, semiempirical
 from pyscf.geomopt import geometric_solver
+from gpu4pyscf.dft import rks
 from typing import Tuple, Optional, List
 import time
 from multiprocessing import Pool, cpu_count
 import warnings
 warnings.filterwarnings('ignore')
+
+import logging
 
 verbose=0
 
@@ -155,7 +158,7 @@ def optimize_semiempirical(smiles: str, max_geom_steps: int = 25, method: str = 
         return mf.e_tot, mf.scf_cycles if hasattr(mf, 'scf_cycles') else 1, method
         
     except Exception as e:
-        print(f"Semi-empirical failed for {smiles}: {str(e)}")
+        print(f"Semi-empirical failed for {smiles}: {str(e)}", flush=True)
         return None, 0, f"{method}_failed"
 
 
@@ -179,7 +182,8 @@ def optimize_fast_dft(smiles: str, max_cycle: int = 10, max_geom_steps: int = 25
         mf.level_shift = 0.1     # Level shifting can help convergence
         
         # For very large molecules, consider:
-        mf.direct_scf = True     # Use direct SCF (less memory, sometimes faster)
+        if len(smiles) > 40:
+          mf.direct_scf = True     # Use direct SCF (less memory, sometimes faster)
 
         global verbose
         mf.verbose = verbose
@@ -195,7 +199,55 @@ def optimize_fast_dft(smiles: str, max_cycle: int = 10, max_geom_steps: int = 25
     except Exception as e:
         print(f"DFT failed for {smiles}: {str(e)}")
         return None, 0, "dft_failed"
-    
+
+def optimize_gpu_dft(smiles: str, max_cycle: int = 10, max_geom_steps: int = 25, conv=1e-5, add_hydrogen=True) -> Tuple[float, int, str]:
+    """
+    Fast DFT calculation with LDA functional
+    Returns: (energy, cycles, method_used)
+    """
+    logger = logging.getLogger(f"{smiles}")
+    fh = logging.FileHandler("worker.log", mode="a")
+    formatter = logging.Formatter(
+        "%(asctime)s [PID %(process)d] %(levelname)s: %(message)s"
+    )
+    fh.setFormatter(formatter)
+    logger.addHandler(fh)
+    logger.setLevel(logging.DEBUG)
+
+    try:
+        mymol = create_gto_mol(smiles, add_hydrogen=add_hydrogen, basis_set='def2-tzvpp')
+
+        mf = rks.RKS(mymol)
+        mf.xc = 'b3lyp'  # Fastest DFT functional
+        mf.conv_tol = conv  # Looser convergence
+        mf.max_cycle = max_cycle
+
+        # Key optimizations for large molecules:
+        mf.init_guess = 'minao'  # Faster initial guess
+        mf.diis_space = 12       # Larger DIIS space for better convergence
+        mf.level_shift = 0.1     # Level shifting can help convergence
+        
+        # For very large molecules, consider:
+        if len(smiles) > 40:
+          mf.direct_scf = True     # Use direct SCF (less memory, sometimes faster)
+
+        logger.info(f"Starting dft for {smiles}")
+        mf.verbose=7
+        mf.stdout = open("pyscflog.log", mode="a")
+
+        mf.density_fit().to_gpu()
+
+        #mol_eq = geometric_solver.optimize(mf, maxsteps=max_geom_steps)
+        mf.kernel()
+
+        logger.info(f"DFT Complete, returning for {smiles}")
+        
+        return mf.e_tot, mf.scf_cycles if hasattr(mf, 'scf_cycles') else max_cycle, "dft_cam_b3lyp_def2-tzvpp"
+        
+    except Exception as e:
+        logger.error(f"DFT failed for {smiles}: {str(e)}")
+        return None, 0, "dft_failed"
+
 
 def optimize_hf(smiles: str, max_cycle: int = 10, max_geom_steps: int = 25, conv: float = 1e-4, add_hydrogen=True) -> Tuple[float, int, str]:
     """
@@ -218,7 +270,7 @@ def optimize_hf(smiles: str, max_cycle: int = 10, max_geom_steps: int = 25, conv
         return mf.e_tot, mf.scf_cycles if hasattr(mf, 'scf_cycles') else max_cycle, "hf"
     
     except Exception as e:
-        print(f"HF failed for {smiles}: {str(e)}")
+        print(f"HF failed for {smiles}: {str(e)}", flush=True)
         return None, 0, "hf_failed"
     
 
@@ -228,7 +280,17 @@ def process_single_polymer(args) -> Tuple[str, str, float, str, int, float]:
     Returns: (monomer_smiles, polymer_smiles, energy, method, cycles, calc_time, )
     """
     monomer_smiles, polymer_smiles, method, monomer_count = args
-    
+
+    logger = logging.getLogger(f"{polymer_smiles}")
+    fh = logging.FileHandler("worker.log", mode="a")
+    formatter = logging.Formatter(
+        "%(asctime)s [PID %(process)d] %(levelname)s: %(message)s"
+    )
+    fh.setFormatter(formatter)
+    logger.addHandler(fh)
+    logger.setLevel(logging.DEBUG)
+
+    logger.info(f"Task: {polymer_smiles}")
     start_time = time.time()
     
     try:
@@ -238,19 +300,20 @@ def process_single_polymer(args) -> Tuple[str, str, float, str, int, float]:
             energy, cycles, method_used = optimize_fast_dft(polymer_smiles, max_cycle=20)
         elif method == 'hf':
             energy, cycles, method_used = optimize_hf(polymer_smiles)
+        elif method == 'dft_gpu':
+            energy, cycles, method_used = optimize_gpu_dft(polymer_smiles, max_cycle=30)
         else:
+            logger.error(f"Unknown method: {method}")
             raise ValueError(f"Unknown method: {method}")
         
         calc_time = time.time() - start_time
-        global verbose
-        if verbose:
-            print("Sucessfully calculated energy for", polymer_smiles, "\nCompleted in: ", calc_time, " Energy:", energy, " Cycles: ", cycles, " Monomer count:", monomer_count, flush=True)
+        logger.info("Sucessfully calculated energy for", polymer_smiles, "\nCompleted in: ", calc_time, " Energy:", energy, " Cycles: ", cycles, " Monomer count:", monomer_count)
 
         return monomer_smiles, polymer_smiles, energy, method_used, cycles, calc_time, monomer_count
         
     except Exception as e:
         calc_time = time.time() - start_time
-        print(f"Failed to process {polymer_smiles}: {str(e)}", flush=True)
+        logger.error(f"Failed to process {polymer_smiles}: {str(e)}")
         return monomer_smiles, polymer_smiles, None, f"{method}_error", 0, calc_time, monomer_count
 
 
@@ -281,36 +344,39 @@ def calculate_polymer_energies(monomer_smiles_list: List[str],
     pd.DataFrame with columns: monomer_smiles, polymer_smiles, zero_energy, method, cycle_count, calc_time
     """
 
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(processName)s - %(levelname)s - %(message)s')
+    logger = logging.getLogger(__name__)
+
     import multiprocessing as mp
     mp.set_start_method("spawn", force=True)
     
     if n_processes is None:
-        n_processes = min(cpu_count(), 4)  # Limit to 4 for Raspberry Pi
+        n_processes = cpu_count()  # Limit to 4 for Raspberry Pi
     
-    print(f"Generating polymer chains for {len(monomer_smiles_list)} monomers...")
+    logger.info(f"Generating polymer chains for {len(monomer_smiles_list)} monomers...")
     
     # Generate all polymer combinations
     all_tasks = []
     for monomer in monomer_smiles_list:
-        print(f"Generating chains for monomer: {monomer}")
+        logger.info(f"Generating chains for monomer: {monomer}")
         polymer_length_pairs = list(iterative_extend_smiles(monomer, max_chain_length, max_polymers_per_monomer))
-        print(f"  Generated {len(polymer_length_pairs)} polymer configurations")
+        logger.info(f"  Generated {len(polymer_length_pairs)} polymer configurations")
         
         for polymer, monomer_count in polymer_length_pairs:
             all_tasks.append((monomer, polymer, method, monomer_count))
     
-    print(f"Total calculations to perform: {len(all_tasks)}")
-    print(f"Using {n_processes} parallel processes")
+    logger.info(f"Total calculations to perform: {len(all_tasks)}")
+    logger.info(f"Using {n_processes} parallel processes")
     dur = "1-10" if method=='semiempirical' else "10-60"
-    print(f"Estimated time per calculation: {dur} seconds")
+    logger.info(f"Estimated time per calculation: {dur} seconds")
     
     # Process in parallel
     results = []
-    batch_size = 5  # Process in batches to avoid memory issues
+    batch_size = 100  # Process in batches to avoid memory issues
     
     for i in range(0, len(all_tasks), batch_size):
         batch = all_tasks[i:i+batch_size]
-        print(f"Processing batch {i//batch_size + 1}/{(len(all_tasks)-1)//batch_size + 1} ({len(batch)} calculations)", flush=True)
+        logger.info(f"Processing batch {i//batch_size + 1}/{(len(all_tasks)-1)//batch_size + 1} ({len(batch)} calculations)")
         
         with Pool(n_processes) as pool:
             batch_results = pool.map(process_single_polymer, batch)
@@ -322,7 +388,7 @@ def calculate_polymer_energies(monomer_smiles_list: List[str],
             avg_time = sum(r[5] for r in results[-len(batch):]) / len(batch)
             remaining = len(all_tasks) - completed
             eta_hours = (remaining * avg_time) / 3600 / n_processes
-            print(f"  Batch completed. Average time: {avg_time:.1f}s. ETA: {eta_hours:.1f} hours", flush=True)
+            logger.info(f"  Batch completed. Average time: {avg_time:.1f}s. ETA: {eta_hours:.1f} hours")
     
     # Create DataFrame
     df = pd.DataFrame(results, columns=[
@@ -332,7 +398,7 @@ def calculate_polymer_energies(monomer_smiles_list: List[str],
     # Remove failed calculations
     df = df.dropna(subset=['zero_energy'])
     
-    print(f"Completed calculations: {len(df)}")
-    print(f"Failed calculations: {len(results) - len(df)}")
+    logger.info(f"Completed calculations: {len(df)}")
+    logger.info(f"Failed calculations: {len(results) - len(df)}")
     
     return df
