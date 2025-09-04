@@ -11,6 +11,26 @@ warnings.filterwarnings('ignore')
 
 verbose=0
 
+# HACK, do not use normally
+def patched_get_init_guess(self, mol, basis=None, s1e=None, **kwargs):
+    """Fallback: RHF guess but projected into semiempirical basis."""
+    rhf = scf.RHF(mol)
+    dm = rhf.get_init_guess(mol, basis=basis)
+
+    # project AO density to semiempirical basis size
+    nao_semi = self.nao_nr()  # number of orbitals in semiempirical model
+    nao_full = dm.shape[0]
+
+    if nao_full != nao_semi:
+        # crude projection: just slice (better: overlap-based projection)
+        dm = dm[:nao_semi, :nao_semi]
+
+    return dm
+
+from pyscf.semiempirical import RMINDO3
+# Patch RMINDO3 dynamically
+RMINDO3.get_init_guess = patched_get_init_guess
+
 from data_gen_helpers import iterative_extend_smiles
 import pandas as pd
 
@@ -112,10 +132,17 @@ def optimize_semiempirical(smiles: str, max_geom_steps: int = 25, method: str = 
     try:
         mymol = create_gto_mol(smiles, add_hydrogen=add_hydrogen)
 
+        print("starting RHF")
+        mf0 = scf.RHF(mymol)
+        mf0.max_cycle = 0  # only the initial guess
+        mf0.kernel()
+        mf0.make_rdm1()
+
+        print("HF ended successfully, continuing to semiempirical")
+
         # Semi-empirical calculation
         if method == 'MINDO':
             mf = semiempirical.MINDO3(mymol)
-            mf.build(mymol)
         else:
             raise ValueError(f"Unknown semi-empirical method: {method}")
             
@@ -123,7 +150,7 @@ def optimize_semiempirical(smiles: str, max_geom_steps: int = 25, method: str = 
         mf.verbose = verbose
         
         #mol_eq = geometric_solver.optimize(mf, maxsteps=max_geom_steps)
-        mf.run()
+        mf.kernel()
         
         return mf.e_tot, mf.scf_cycles if hasattr(mf, 'scf_cycles') else 1, method
         
@@ -143,7 +170,7 @@ def optimize_fast_dft(smiles: str, max_cycle: int = 10, max_geom_steps: int = 25
         mf = scf.RKS(mymol)
         mf.xc = 'lda,vwn'  # Fastest DFT functional
         mf.conv_tol = conv  # Looser convergence
-        mf.max_cycle = 2
+        mf.max_cycle = max_cycle
 
             # Key optimizations for large molecules:
         mf.init_guess = 'minao'  # Faster initial guess
@@ -198,9 +225,9 @@ def optimize_hf(smiles: str, max_cycle: int = 10, max_geom_steps: int = 25, conv
 def process_single_polymer(args) -> Tuple[str, str, float, str, int, float]:
     """
     Process a single polymer calculation
-    Returns: (monomer_smiles, polymer_smiles, energy, method, cycles, calc_time)
+    Returns: (monomer_smiles, polymer_smiles, energy, method, cycles, calc_time, )
     """
-    monomer_smiles, polymer_smiles, method = args
+    monomer_smiles, polymer_smiles, method, monomer_count = args
     
     start_time = time.time()
     
@@ -208,7 +235,7 @@ def process_single_polymer(args) -> Tuple[str, str, float, str, int, float]:
         if method == 'semiempirical':
             energy, cycles, method_used = optimize_semiempirical(polymer_smiles, 'MINDO')
         elif method == 'dft':
-            energy, cycles, method_used = optimize_fast_dft(polymer_smiles)
+            energy, cycles, method_used = optimize_fast_dft(polymer_smiles, max_cycle=20)
         elif method == 'hf':
             energy, cycles, method_used = optimize_hf(polymer_smiles)
         else:
@@ -217,14 +244,14 @@ def process_single_polymer(args) -> Tuple[str, str, float, str, int, float]:
         calc_time = time.time() - start_time
         global verbose
         if verbose:
-            print("Sucessfully calculated energy for", polymer_smiles, "Completed in:", calc_time, "Energy:", energy, "Cycles:", cycles)
+            print("Sucessfully calculated energy for", polymer_smiles, "\nCompleted in: ", calc_time, " Energy:", energy, " Cycles: ", cycles, " Monomer count:", monomer_count, flush=True)
 
-        return monomer_smiles, polymer_smiles, energy, method_used, cycles, calc_time
+        return monomer_smiles, polymer_smiles, energy, method_used, cycles, calc_time, monomer_count
         
     except Exception as e:
         calc_time = time.time() - start_time
-        print(f"Failed to process {polymer_smiles}: {str(e)}")
-        return monomer_smiles, polymer_smiles, None, f"{method}_error", 0, calc_time
+        print(f"Failed to process {polymer_smiles}: {str(e)}", flush=True)
+        return monomer_smiles, polymer_smiles, None, f"{method}_error", 0, calc_time, monomer_count
 
 
 def calculate_polymer_energies(monomer_smiles_list: List[str], 
@@ -253,6 +280,9 @@ def calculate_polymer_energies(monomer_smiles_list: List[str],
     --------
     pd.DataFrame with columns: monomer_smiles, polymer_smiles, zero_energy, method, cycle_count, calc_time
     """
+
+    import multiprocessing as mp
+    mp.set_start_method("spawn", force=True)
     
     if n_processes is None:
         n_processes = min(cpu_count(), 4)  # Limit to 4 for Raspberry Pi
@@ -263,11 +293,11 @@ def calculate_polymer_energies(monomer_smiles_list: List[str],
     all_tasks = []
     for monomer in monomer_smiles_list:
         print(f"Generating chains for monomer: {monomer}")
-        polymers = list(iterative_extend_smiles(monomer, max_chain_length, max_polymers_per_monomer))
-        print(f"  Generated {len(polymers)} polymer configurations")
+        polymer_length_pairs = list(iterative_extend_smiles(monomer, max_chain_length, max_polymers_per_monomer))
+        print(f"  Generated {len(polymer_length_pairs)} polymer configurations")
         
-        for polymer in polymers:
-            all_tasks.append((monomer, polymer, method))
+        for polymer, monomer_count in polymer_length_pairs:
+            all_tasks.append((monomer, polymer, method, monomer_count))
     
     print(f"Total calculations to perform: {len(all_tasks)}")
     print(f"Using {n_processes} parallel processes")
@@ -276,11 +306,11 @@ def calculate_polymer_energies(monomer_smiles_list: List[str],
     
     # Process in parallel
     results = []
-    batch_size = 100  # Process in batches to avoid memory issues
+    batch_size = 5  # Process in batches to avoid memory issues
     
     for i in range(0, len(all_tasks), batch_size):
         batch = all_tasks[i:i+batch_size]
-        print(f"Processing batch {i//batch_size + 1}/{(len(all_tasks)-1)//batch_size + 1} ({len(batch)} calculations)")
+        print(f"Processing batch {i//batch_size + 1}/{(len(all_tasks)-1)//batch_size + 1} ({len(batch)} calculations)", flush=True)
         
         with Pool(n_processes) as pool:
             batch_results = pool.map(process_single_polymer, batch)
@@ -292,11 +322,11 @@ def calculate_polymer_energies(monomer_smiles_list: List[str],
             avg_time = sum(r[5] for r in results[-len(batch):]) / len(batch)
             remaining = len(all_tasks) - completed
             eta_hours = (remaining * avg_time) / 3600 / n_processes
-            print(f"  Batch completed. Average time: {avg_time:.1f}s. ETA: {eta_hours:.1f} hours")
+            print(f"  Batch completed. Average time: {avg_time:.1f}s. ETA: {eta_hours:.1f} hours", flush=True)
     
     # Create DataFrame
     df = pd.DataFrame(results, columns=[
-        'monomer_smiles', 'polymer_smiles', 'zero_energy', 'method', 'cycle_count', 'calc_time'
+        'monomer_smiles', 'polymer_smiles', 'zero_energy', 'method', 'cycle_count', 'calc_time', "monomer_count"
     ])
     
     # Remove failed calculations

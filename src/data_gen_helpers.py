@@ -1,4 +1,4 @@
-from typing import Optional, List, Set, AsyncGenerator, Union, Generator
+from typing import Optional, List, Set, AsyncGenerator, Union, Generator, Tuple
 from pysmiles import read_smiles, write_smiles
 from rdkit import Chem
 import asyncio
@@ -77,13 +77,13 @@ def iterative_extend_smiles(
     smiles: str,
     max_length: int = 150,
     max_output: Optional[int] = None
-) -> Generator[str, None, None]:
+) -> Generator[Tuple[str, int], None, None]:
     """Asynchronously yield new SMILES strings by iteratively extending fragments at '*' positions.
        Avoids duplicates and handles fragment symmetries.
     """
     frag_length = read_smiles(smiles).number_of_nodes()
     if frag_length >= max_length:
-        yield smiles
+        yield (smiles, 1)
         return
     
     print(frag_length)
@@ -99,10 +99,11 @@ def iterative_extend_smiles(
             unique_frags.append(f)
 
     visited: Set[str] = set()
+    max_chain_extend = max_length // frag_length
 
     def helper(current_smiles: str, depth_left: int) -> Generator[str, None, None]:
         if depth_left == 0:
-            yield current_smiles
+            yield (current_smiles, max_chain_extend)
             return
 
         for frag in unique_frags:
@@ -111,15 +112,16 @@ def iterative_extend_smiles(
                 can_s = Chem.MolToSmiles(Chem.MolFromSmiles(s))
                 if can_s not in visited:
                     visited.add(can_s)
-                    yield can_s  # yield immediately instead of collecting in a list
+                    yield (can_s, max_chain_extend-depth_left+1)  # yield immediately instead of collecting in a list
                     if max_output and len(visited) >= max_output:
                         return
-                    for res in helper(can_s, depth_left - 1):
+                    for res, _ in helper(can_s, depth_left - 1):
                         yield res
                         if max_output and len(visited) >= max_output:
                             return
 
     start = Chem.MolToSmiles(Chem.MolFromSmiles(smiles))
     visited.add(start)
-    for result in helper(start, max_length // frag_length):
+    
+    for result in helper(start, max_chain_extend):
         yield result
