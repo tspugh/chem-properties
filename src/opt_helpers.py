@@ -218,7 +218,7 @@ def optimize_gpu_dft(smiles: str, max_cycle: int = 10, max_geom_steps: int = 25,
         mymol = create_gto_mol(smiles, add_hydrogen=add_hydrogen, basis_set='def2-tzvpp')
 
         mf = rks.RKS(mymol)
-        mf.xc = 'b3lyp'  # Fastest DFT functional
+        mf.xc = 'lds, vwn'  # Fastest DFT functional
         mf.conv_tol = conv  # Looser convergence
         mf.max_cycle = max_cycle
 
@@ -242,7 +242,7 @@ def optimize_gpu_dft(smiles: str, max_cycle: int = 10, max_geom_steps: int = 25,
 
         logger.info(f"DFT Complete, returning for {smiles}")
         
-        return mf.e_tot, mf.scf_cycles if hasattr(mf, 'scf_cycles') else max_cycle, "dft_cam_b3lyp_def2-tzvpp"
+        return mf.e_tot, mf.scf_cycles if hasattr(mf, 'scf_cycles') else max_cycle, "dft_ldf_def2-tzvpp"
         
     except Exception as e:
         logger.error(f"DFT failed for {smiles}: {str(e)}")
@@ -301,7 +301,7 @@ def process_single_polymer(args) -> Tuple[str, str, float, str, int, float]:
         elif method == 'hf':
             energy, cycles, method_used = optimize_hf(polymer_smiles)
         elif method == 'dft_gpu':
-            energy, cycles, method_used = optimize_gpu_dft(polymer_smiles, max_cycle=30)
+            energy, cycles, method_used = optimize_gpu_dft(polymer_smiles, max_cycle=10)
         else:
             logger.error(f"Unknown method: {method}")
             raise ValueError(f"Unknown method: {method}")
