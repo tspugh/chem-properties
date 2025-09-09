@@ -120,13 +120,22 @@ def minimal_orbital_token(atomic_num, include_star_dim = False):
 
     return token
 
-def create_node_features(mol, replace_with_hydrogen=False):
+def create_node_features(mol, replace_with_hydrogen=False, use_position=True):
+    from rdkit.Chem import rdDistGeom
     node_features = []
-    for atom in mol.GetAtoms():
+    m3d = Chem.Mol(mol)
+    if use_position:
+        rdDistGeom.EmbedMolecule(m3d,randomSeed=0xa100f)
+    for atom in m3d.GetAtoms():
         atomic_num = atom.GetAtomicNum()
+        if use_position:
+            position = atom.GetAtomPosition()
+            pos_vector = torch.tensor([position.x, position.y, position.z], dtype=torch.float32)
         if atomic_num == 0 and replace_with_hydrogen:
             atomic_num = 1
         feature_vector = minimal_orbital_token(atomic_num, include_star_dim=(not replace_with_hydrogen)) # dim = 6
+        if use_position:
+            feature_vector = torch.cat([feature_vector, pos_vector], dim=0)
         node_features.append(feature_vector)
 
     return torch.stack(node_features, dim=0).to(torch.float32)
