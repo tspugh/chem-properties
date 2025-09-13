@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 from typing import Any, Dict, List, Literal, Optional, Tuple, TypedDict, Union
 import inspect
+import math
 import torch
 from torch import Tensor
 import torch.nn as nn
@@ -28,6 +29,7 @@ from torch_geometric.utils import (
     bipartite_subgraph,
     dropout_adj,
     dropout_edge,
+    batched_negative_sampling,
     dropout_node,
     negative_sampling,
     subgraph,
@@ -555,11 +557,19 @@ class KMeans(nn.Module):
 class VGAEEncoder(nn.Module):
     """VGAE Encoder for GraphHRMAttentionBlock"""
     
-    def __init__(self, input_dim: int, hidden_dim: int, latent_dim: int, 
-                 layers: int, dropout: float, encoder_type: str = "gcn"):
+    def __init__(self, input_dim: int, hidden_dim: int, latent_dim: int, edge_dim: int,
+                 layers: int, dropout: float, encoder_type: str = "gcn", use_norm: bool = True):
         super(VGAEEncoder, self).__init__()
         self.encoder_type = encoder_type
         self.layers = layers
+        self.edge_dim = edge_dim
+
+        self.use_norm = use_norm
+        self.norms = nn.ModuleList()
+        if self.use_norm:
+            for _ in range(layers-1):
+                self.norms.append(LayerNorm(hidden_dim))
+        
         
         # Build encoder layers
         if encoder_type == "gcn":
@@ -584,12 +594,14 @@ class VGAEEncoder(nn.Module):
             raise ValueError(f"Unsupported encoder type: {encoder_type}")
         
         self.dropout = dropout
+
+        self.edge_attr_linear = nn.Linear(edge_dim, 1)
     
     def reset_parameters(self):
         for conv in self.convs:
             conv.reset_parameters()
         
-    def forward(self, x: Tensor, edge_index: Tensor, batch: Optional[Tensor] = None) -> Tuple[Tensor, Tensor]:
+    def forward(self, x: Tensor, edge_index: Tensor, edge_attr: Optional[Tensor] = None, batch: Optional[Tensor] = None) -> Tuple[Tensor, Tensor]:
         """
         Forward pass returning mu and logstd
         
@@ -598,12 +610,27 @@ class VGAEEncoder(nn.Module):
             edge_index: Edge connectivity tensor
             batch: Batch assignment tensor for batched processing
         """
+        if len(self.convs) == 0:
+            return x, x
+        sig = inspect.signature(self.convs[0].forward)
+
         # PyTorch Geometric convolutions handle batching automatically via the data structure
         for i, conv in enumerate(self.convs[:-1]):
-            x = conv(x, edge_index)
+            if 'edge_attr' in sig.parameters and edge_attr is not None:
+                x = conv(x, edge_index, edge_attr=edge_attr)
+            elif 'edge_weight' in sig.parameters and edge_attr is not None:
+                in_edge_attr = F.relu(self.edge_attr_linear(edge_attr))
+                x = conv(x, edge_index, edge_weight=in_edge_attr)
+            else:
+                x = conv(x, edge_index)    
+
             x = F.relu(x)
+
             if self.training and self.dropout is not None:
                 x = F.dropout(x, p=self.dropout)
+
+            if self.use_norm:
+                x = self.norms[i](x)
         
         # Final layer for mean (mu)
         mu = self.convs[-1](x, edge_index)
@@ -725,31 +752,22 @@ class OutputHead(nn.Module):
 
 class KMeansHRMInnerModuleConfig(TypedDict):
     add_self_loops: bool
+    add_negative_edges: bool
     dropout: float
     hidden_dim: int
     edge_dim: int
     node_dim: int
     layers: int
+    attention_dim: int
 
     kmeans_config: KMeansConfig
     output_head_config: OutputHeadConfig
     policy_module_config: OutputHeadConfig
-    add_negative_edges: bool
     K_cycles: int
     L_cycles: int
     batch_size: int
     halt_max_steps: int
     halt_exploration_prob: float
-
-
-    vgae_encoder_type: str
-    vgae_latent_dim: int
-    vgae_encoder_layers: int
-    vgae_encoder_dropout: float
-    vgae_decoder_type: Optional[str]
-    vgae_kl_weight: float
-
-    
 
 
 
@@ -759,13 +777,14 @@ class KMeansHRMInnerModule(nn.Module):
         super(KMeansHRMInnerModule, self).__init__()
         self.config = config
         self.add_self_loops = self.config['add_self_loops']
+        self.add_negative_edges = self.config['add_negative_edges']
         self.dropout = self.config['dropout']
         self.hidden_dim = self.config['hidden_dim']
         self.node_dim = self.config['node_dim']
         self.layers = self.config['layers']
         self.edge_dim = self.config['edge_dim']
 
-        self.latent_dim = self.config['vgae_latent_dim']
+        self.attention_dim = self.config['attention_dim']
 
         self.kmeans_config = self.config['kmeans_config']
         self.k = self.kmeans_config['k']
@@ -787,51 +806,17 @@ class KMeansHRMInnerModule(nn.Module):
 
         self.kmeans_module = KMeans(self.kmeans_config, training=training)
 
-        prevgae_attention_layers = []
-        prevgae_attention_layers.append(torch.nn.Linear(self.edge_dim, self.hidden_dim))
-        prevgae_attention_layers.append(torch.nn.ReLU())
-        for _ in range(max(0, self.layers-2)):
-            prevgae_attention_layers.append(torch.nn.Linear(self.hidden_dim, self.hidden_dim))
-            prevgae_attention_layers.append(torch.nn.ReLU())
-        prevgae_attention_layers.append(torch.nn.Linear(self.hidden_dim, self.node_dim * self.hidden_dim))
-        self.prevgae_attention_layers = nn.Sequential(*prevgae_attention_layers)
-
-        self.encode_conv = NNConv(
-            in_channels=self.node_dim,
-            out_channels=self.hidden_dim,
-            nn=self.prevgae_attention_layers,
-            aggr='mean'
-        )
-
+        self.vgae_encoder = VGAEEncoder(self.node_dim, self.attention_dim, self.node_dim, self.edge_dim, self.attention_dim, self.dropout, use_norm=True)
+        self.vgae = VGAE(self.vgae_encoder)
+        
         self.linear_post_attention = nn.Sequential(
-            nn.Linear(self.latent_dim, self.node_dim * 8),
+            nn.Linear(self.node_dim, self.node_dim * 8),
             nn.ReLU(),
             (nn.Dropout(self.dropout if training else 0.0)),
             nn.Linear(self.node_dim * 8, self.node_dim),
             nn.LayerNorm(self.node_dim)
         )
         
-        # Initialize VGAE if configured
-        self.vgae_encoder = VGAEEncoder(
-            input_dim=self.hidden_dim,  # Assuming node features dimension
-            hidden_dim=self.hidden_dim,
-            latent_dim=self.latent_dim,
-            layers=self.config['vgae_encoder_layers'],
-            dropout=self.config['vgae_encoder_dropout'] if training else 0.0,
-            encoder_type=self.config['vgae_encoder_type']
-        )
-        
-        # Initialize VGAE model
-        decoder = None
-        if self.config.get('vgae_decoder_type') == "custom":
-            # You can implement a custom decoder here
-            decoder = InnerProductDecoder()  # Fallback to default
-        
-        self.vgae = VGAE(
-            encoder=self.vgae_encoder,
-            decoder=decoder
-        )
-
         channels = self.k
         if self.excluded_is_cluster:
             channels += 1
@@ -845,10 +830,8 @@ class KMeansHRMInnerModule(nn.Module):
     def reset_parameters(self):
         """Reset parameters for all modules in 83Module"""
         self.kmeans_module.reset_parameters()
-        self.vgae_encoder.reset_parameters()
-        self.vgae.reset_parameters()
-        if hasattr(self.prevgae_attention_layers, 'reset_parameters'):
-            self.prevgae_attention_layers.reset_parameters()
+        if hasattr(self.linear_post_attention, 'reset_parameters'):
+            self.linear_post_attention.reset_parameters()
         # Reset linear layers and norms safely
         for module in self.linear_post_attention:
             if hasattr(module, 'reset_parameters'):
@@ -858,7 +841,10 @@ class KMeansHRMInnerModule(nn.Module):
         # Dropout has no parameters to reset
         self.output_head.reset_parameters()
         self.policy_module.reset_parameters()
-        
+        if hasattr(self.vgae_encoder, 'reset_parameters'):
+            self.vgae_encoder.reset_parameters()
+        if hasattr(self.vgae, 'reset_parameters'):
+            self.vgae.reset_parameters()
         # Reset input embeddings if they exist
         if hasattr(self, 'input_embedding'):
             self.input_embedding.reset_parameters()
@@ -909,9 +895,24 @@ class KMeansHRMInnerModule(nn.Module):
         # Adjust edge indices: input edges stay as-is, subgraph edges are offset
         offset_subgraph_edges = torch.add(edge_index, input_nodes.shape[0])
         combined_edge_index = torch.cat([input_edges, offset_subgraph_edges], dim=1)
+        end_subgraph_edges = combined_edge_index.shape[1]
 
         synthetic_edge_attr = torch.zeros(edge_index.shape[1], input_edge_attr.shape[1], dtype=input_edge_attr.dtype, device=input_edge_attr.device)
         combined_edge_attr = torch.cat([input_edge_attr, synthetic_edge_attr], dim=0)
+
+        if self.add_negative_edges:
+            negative_samples = min(end_subgraph_edges//(int(math.floor(1/(self.dropout+1e-4)))), end_subgraph_edges//6)
+
+            neg_edges = None
+            if batch is not None and not self.training:
+                neg_edges = batched_negative_sampling(combined_edge_index, torch.cat([torch.zeros(input_nodes.shape[0], dtype=batch.dtype, device=batch.device), batch]), num_neg_samples=negative_samples)
+            elif not self.training:
+                neg_edges = negative_sampling(combined_edge_index, num_nodes=total_nodes.shape[0], num_neg_samples=negative_samples)
+            if neg_edges is not None:
+                synth_neg_attr = torch.zeros(neg_edges.shape[1], input_edge_attr.shape[1], dtype=input_edge_attr.dtype, device=input_edge_attr.device)
+                combined_edge_index = torch.cat([neg_edges, combined_edge_index], dim=1)
+                combined_edge_attr = torch.cat([synth_neg_attr, combined_edge_attr], dim=0)
+                offset_subgraph_edges += neg_edges.shape[1]
         
         # Create batch tensor for the combined graph
         if batch is not None:
@@ -927,10 +928,8 @@ class KMeansHRMInnerModule(nn.Module):
         else:
             combined_batch = None
 
-        total_nodes = self.encode_conv(total_nodes, combined_edge_index, edge_attr=combined_edge_attr)
-
         # Encode through VGAE
-        total_nodes = self.vgae(total_nodes, combined_edge_index, batch=combined_batch)[0]
+        total_nodes, total_edge_index = self.vgae(total_nodes, combined_edge_index, edge_attr=combined_edge_attr, batch=combined_batch)
     
         subgraph_nodes = total_nodes[input_nodes.shape[0]:]
         
@@ -1139,11 +1138,27 @@ class KMeansHRMConfig(TypedDict):
     explore_steps_prob: float
     halt_max_steps: int
 
+    input_dim: int
+    edge_attr_dim: int
+    pre_encoder_conv_layers: int
+
+    # VGAE configuration moved here
+    vgae_encoder_type: str
+    vgae_latent_dim: int
+    vgae_encoder_layers: int
+    vgae_encoder_dropout: float
+    vgae_decoder_type: Optional[str]
+    vgae_kl_weight: float
+
 
 class KMeansHRMModule(nn.Module):
 
     def __init__(self, config: KMeansHRMConfig, training: bool = True):
         super(KMeansHRMModule, self).__init__()
+
+        self.pre_encoder_conv = None
+        self.pre_encoder_conv_initialized = False
+
         self.config = config
         self.inner_module = KMeansHRMInnerModule(config['inner_module'], training=training)
         self.explore_steps_prob = config['explore_steps_prob']
@@ -1151,10 +1166,84 @@ class KMeansHRMModule(nn.Module):
 
         self.training = training
 
-    def initial_carry(self, batch: Batch) -> KMeansHRMInitialCarry:
+        self.input_dim = config['input_dim']
+        self.edge_attr_dim = config['edge_attr_dim']
+        self.latent_dim = config['vgae_latent_dim']
+
+        self.pre_encoder_conv_layers = config['pre_encoder_conv_layers']
+
+        # Ensure latent dim equals inner node_dim
+        assert config['vgae_latent_dim'] == self.inner_module.node_dim, \
+            f"vgae_latent_dim ({config['vgae_latent_dim']}) must equal inner node_dim ({self.inner_module.node_dim})"
+
+        # Lazy-initialize VGAE when we see first batch (to know input_dim)
+        self._vgae_initialized = False
+        self.vgae_encoder: Optional[VGAEEncoder] = None
+        self.vgae: Optional[VGAE] = None
+
+        self._ensure_pre_vgae()
+        self._ensure_vgae()
+        
+
+    def _ensure_pre_vgae(self):
+        CONSTANT_INNER_DIM = 4
+        CONSTANT_PRE_ENCODER_DROPOUT = 0.1
+        if not self.pre_encoder_conv_initialized:
+
+            prevgae_list = []
+            prevgae_list.append(nn.Linear(self.edge_attr_dim, self.input_dim*CONSTANT_INNER_DIM))
+
+            for _ in range(self.pre_encoder_conv_layers):
+                prevgae_list.append(nn.Linear(self.input_dim*CONSTANT_INNER_DIM, self.input_dim*CONSTANT_INNER_DIM))
+                prevgae_list.append(nn.ReLU())
+                prevgae_list.append(nn.Dropout(CONSTANT_PRE_ENCODER_DROPOUT))
+            
+            prevgae_list.append(nn.Linear(self.input_dim*CONSTANT_INNER_DIM, self.input_dim**2))
+
+            pre_encoder_conv_nn = nn.Sequential(*prevgae_list)
+
+            self.pre_encoder_conv = NNConv(
+                in_channels=self.input_dim,
+                out_channels=self.input_dim,
+                nn=pre_encoder_conv_nn,
+                aggr='mean'
+            )
+            self.pre_encoder_conv_initialized = True
+
+    def _ensure_vgae(self):
+        if not self._vgae_initialized:
+            self.vgae_encoder = VGAEEncoder(
+                input_dim=self.input_dim,
+                hidden_dim=self.inner_module.hidden_dim,
+                latent_dim=self.latent_dim,
+                edge_dim=self.edge_attr_dim,
+                layers=self.config['vgae_encoder_layers'],
+                dropout=self.config['vgae_encoder_dropout'] if self.training else 0.0,
+                encoder_type=self.config['vgae_encoder_type']
+            )
+            decoder = None
+            if self.config.get('vgae_decoder_type') == 'custom':
+                decoder = InnerProductDecoder()
+            self.vgae = VGAE(
+                encoder=self.vgae_encoder,
+                decoder=decoder
+            )
+            self._vgae_initialized = True
+
+    def initial_carry(self, batch: Batch, device: torch.device = DEVICE) -> KMeansHRMInitialCarry:
+
+        self._ensure_vgae()
+        self._ensure_pre_vgae()
+        assert self.vgae is not None
+
+        batch = batch.to(device)
+        x_latent, _ = self.vgae(batch.x, batch.edge_index, edge_attr=getattr(batch, 'edge_attr', None), batch=batch.batch)
+        carry_batch = Data(x=x_latent, edge_index=batch.edge_index, edge_attr=getattr(batch, 'edge_attr', None))
+        carry_batch.batch = batch.batch
+ 
         num_nodes = batch.x.shape[0]  # Total nodes across all graphs
         node_dim = batch.x.shape[1]   # Feature dimension
-        device = batch.x.device
+        device = device or batch.x.device
         
         # Number of graphs in the batch
         if hasattr(batch, 'num_graphs'):
@@ -1164,14 +1253,15 @@ class KMeansHRMModule(nn.Module):
 
         initial_inner_carry = self.inner_module.empty_carry(
             num_nodes=num_nodes, 
-            node_dim=node_dim, 
+            node_dim=self.inner_module.node_dim, 
             device=device, 
             batch=batch.batch
         )
 
-        # Initialize with actual data
-        initial_inner_carry.x = batch.x.clone()
-        initial_inner_carry.edge_index = batch.edge_index.clone()
+        initial_inner_carry.x = carry_batch.x.clone().to(device)
+        initial_inner_carry.edge_index = carry_batch.edge_index.clone().to(device)
+        if carry_batch.edge_attr is not None:
+            initial_inner_carry.edge_attr = carry_batch.edge_attr.clone().to(device)
         
         return KMeansHRMInitialCarry(
             inner_carry=initial_inner_carry,
@@ -1198,11 +1288,20 @@ class KMeansHRMModule(nn.Module):
         # as halted/reset is handled at the graph level in reset_carry
         new_current_data = data
 
+        assert self.vgae is not None, "VGAE not initialized"
+        assert self.pre_encoder_conv is not None, "Pre-encoder convolution not initialized"
+        x_latent = self.pre_encoder_conv(new_current_data.x, new_current_data.edge_index, edge_attr=getattr(new_current_data, 'edge_attr', None))
+        x_latent, _ = self.vgae(x_latent, new_current_data.edge_index, edge_attr=getattr(new_current_data, 'edge_attr', None), batch=new_current_data.batch)
+        new_current_data = Data(x=x_latent, edge_index=new_current_data.edge_index, edge_attr=getattr(new_current_data, 'edge_attr', None))
+        new_current_data.batch = data.batch
+        
+        # Main run
         new_inner_carry, y_pred, (q_halt, q_continue) = self.inner_module(new_inner_carry, new_current_data, new_current_data.batch)
-
+ 
         output = KMeansHRMOutput(
             y_pred=y_pred,
-            q_policy=(q_halt, q_continue)
+            q_policy=(q_halt, q_continue),
+            target_q_policy=None
         )
 
         with torch.no_grad():
@@ -1226,3 +1325,8 @@ class KMeansHRMModule(nn.Module):
     def reset_parameters(self):
         """Reset parameters for inner module"""
         self.inner_module.reset_parameters()
+        if self._vgae_initialized and self.vgae_encoder is not None and self.vgae is not None:
+            self.vgae_encoder.reset_parameters()
+            self.vgae.reset_parameters()
+        if self.pre_encoder_conv_initialized and self.pre_encoder_conv is not None:
+            self.pre_encoder_conv.reset_parameters()

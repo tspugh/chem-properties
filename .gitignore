@@ -13,5 +13,5 @@ wheels/
 data/
 neurips-open-polymer-prediction-2025.zip
 
-checkpoints/step_*.pt
+checkpoints/*/step_*.pt
 *.log
