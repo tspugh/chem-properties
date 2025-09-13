@@ -28,5 +28,5 @@ This project incorporates code from the following sources:
 Modifications have been made by Thomas Pugh
 
 This project is licensed under the Apache License 2.0.
-See individual files and the THIRD_PARTY_LICENSES.md file for details on third-party components.
+
 
