@@ -120,16 +120,41 @@ def minimal_orbital_token(atomic_num, include_star_dim = False):
 
     return token
 
-def create_node_features(mol, replace_with_hydrogen=False, use_position=True):
+from opt_helpers import preoptimize_mol
+def create_node_features(m3d, replace_with_hydrogen=False, use_position=True, opt=False, continue_on_failure=False):
     from rdkit.Chem import rdDistGeom
     node_features = []
-    m3d = Chem.Mol(mol)
-    if use_position:
-        rdDistGeom.EmbedMolecule(m3d,randomSeed=0xa100f)
+    pos_embed_success = False
+    if opt:
+        try:
+            preoptimize_mol(m3d, opt=opt)
+            pos_embed_success = True
+        except Exception as e:
+            print("Embedding failed with error: ", e)
+            if not continue_on_failure:
+                raise RuntimeError("Failed to embed molecule geometry after all attempts", e)
+    elif use_position:
+        for i in range(5):
+            if rdDistGeom.EmbedMolecule(m3d,randomSeed=0xa100f+i) != 0:
+                pos_embed_success = True
+                break
+        else:
+            print("Embedding failed with error: ", e)
+            if not continue_on_failure:
+                raise RuntimeError("Failed to embed molecule geometry after all attempts", e)
+
+    if use_position and pos_embed_success:
+        conformer = m3d.GetConformer()
+        if conformer.GetNumAtoms() == 0:
+            raise RuntimeError("No valid conformer")
+
     for atom in m3d.GetAtoms():
         atomic_num = atom.GetAtomicNum()
         if use_position:
-            position = atom.GetAtomPosition()
+            if pos_embed_success:
+                position = conformer.GetAtomPosition(atom.GetIdx())
+            else:
+                position = torch.tensor([0,0,0], dtype=torch.float32)
             pos_vector = torch.tensor([position.x, position.y, position.z], dtype=torch.float32)
         if atomic_num == 0 and replace_with_hydrogen:
             atomic_num = 1
@@ -166,14 +191,19 @@ def create_edge_features(mol):
     
     return (edge_index, edge_attr)
 
-
-def smiles_to_graph_data(smiles, output):
-    mol = Chem.MolFromSmiles(smiles)
+from opt_helpers import remove_asterisk
+def smiles_to_graph_data(smiles, output, use_position=False, continue_on_failure=False):
+    mol = Chem.MolFromSmiles(remove_asterisk(smiles))
     if mol is None:
         raise ValueError(f"Invalid SMILES string: {smiles}")
-    
-    
-    node_features=create_node_features(mol)
+
+    try:
+        node_features=create_node_features(mol, use_position=use_position, opt=use_position)
+    except Exception as e:
+        print("Node features failed with error: ", e)
+        if not continue_on_failure:
+            raise RuntimeError("Failed to create node features after all attempts", e)
+
     edge_index, edge_attr = create_edge_features(mol)
     data = Data(
         x = node_features,
@@ -187,7 +217,11 @@ def smiles_to_graph_data(smiles, output):
 def smiles_iter_to_graph_dataset(smiles_iter, y):
     dataset = []
     for smiles, output in zip(smiles_iter, y):
-        dataset.append(smiles_to_graph_data(smiles, output))
+        try:
+            dataset.append(smiles_to_graph_data(smiles, output))
+        except Exception as e:
+            print("Failed for ", smiles, "with error: ", e)
+            continue
     
     return dataset
 

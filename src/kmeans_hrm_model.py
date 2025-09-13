@@ -1,67 +1,79 @@
 from dataclasses import dataclass
-from typing import List, Union, Tuple, Optional, Dict, TypedDict, Literal, Any
-
+from typing import Any, Dict, List, Literal, Optional, Tuple, TypedDict, Union
+import inspect
 import torch
 from torch import Tensor
 import torch.nn as nn
 import torch.nn.functional as F
-
+from torch_geometric.data import Batch, Data
 from torch_geometric.nn import (
-    MessagePassing, 
-    GATConv, 
+    ChebConv,
+    GATConv,
     GCNConv,
-    VGAE,
+    GlobalAttention,
     InnerProductDecoder,
     LayerNorm,
+    NNConv,
+    MessagePassing,
+    VGAE,
     global_add_pool,
     global_max_pool,
-    GlobalAttention,
     global_mean_pool,
-    ChebConv,
+    Linear
 )
 from torch_geometric.nn.pool import radius
+from torch_geometric.nn.resolver import activation_resolver, normalization_resolver
 from torch_geometric.utils import (
-    add_self_loops, 
-    subgraph,
+    add_self_loops,
     bipartite_subgraph,
-    dropout_edge,
     dropout_adj,
+    dropout_edge,
     dropout_node,
     negative_sampling,
-    to_undirected
+    subgraph,
+    to_undirected,
 )
-from torch_geometric.nn.resolver import (
-    normalization_resolver,
-    activation_resolver
-)
-from torch_geometric.data import Data, Batch
+
+from torch_scatter import scatter_min
 
 # HEAVILY REFERENCES https://github.com/sapientinc/HRM/blob/05dd4ef795a98c20110e380a330d0b3ec159a46b/models/hrm/hrm_act_v1.py#L222
 
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-@dataclass
-class KMeansCarry:
-    nodes: Tensor
-    mask: Tensor
-    none_selected: Tensor
-    edge_index: Tensor
+class KMeansCarry(Data):
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.mask = kwargs.get('mask', None)
+        self.none_selected = kwargs.get('none_selected', None)
     
     @property
-    def expanded_weights(self) -> Tensor:
-        return self.nodes.unsqueeze(-1)
-
-    def as_list(self) -> List['KMeansCarry']:
-        # Use torch.unbind for parallel processing instead of list comprehension
-        mask_list = torch.unbind(self.mask, dim=1)
-        return [KMeansCarry(nodes=self.nodes, mask=mask, none_selected=self.none_selected, edge_index=self.edge_index) for mask in mask_list]
+    def k(self) -> int:
+        if self.mask is not None:
+            return self.mask.shape[-1]  # Last dimension is k
+        return 0
     
-    def get_subgraphs(self, include_none_selected: bool = False) -> Tuple[Tensor, Tensor]:
-        if include_none_selected:
-            edge_indices, _ = torch.vmap(bipartite_subgraph, dim=0)(torch.cat([self.mask, self.none_selected], dim=1), self.edge_index.unsqueeze(0))
-        else:
-            edge_indices, _ = torch.vmap(bipartite_subgraph, dim=0)(self.mask, self.edge_index.unsqueeze(0))
-        return (self.nodes.unsqueeze(0), edge_indices)
+    def masked_x(self, mask_idx: Optional[int] = None) -> Tensor:
+        """Get masked node features for a specific mask index"""
+        if self.mask is None or mask_idx is not None and mask_idx >= self.mask.shape[-1]:
+            return self.x
+        if mask_idx is None:
+            return torch.stack([self.x * self.mask[:, i:i+1] for i in range(self.mask.shape[-1])], dim=0)
+        return self.x * self.mask[:, mask_idx:mask_idx+1]
+    
+    def masked_edge_index(self, mask_idx: int) -> Tensor:
+        """Get masked edge index for a specific mask index"""
+        if self.mask is None or mask_idx >= self.mask.shape[-1]:
+            return self.edge_index
+        node_mask = self.mask[:, mask_idx] > 0
+        if node_mask.sum() == 0:
+            return torch.empty(2, 0, dtype=torch.long, device=self.edge_index.device)
+        return subgraph(node_mask, self.edge_index)[0]
+
+    def __cat_dim__(self, key, value, *args, **kwargs):
+        if key == 'mask' or key == 'none_selected':
+            return None
+        return super().__cat_dim__(key, value, *args, **kwargs)
 
 # Takes in a mask and feature nodes, outputs a new mask
 class KMeansHeadConfig(TypedDict):
@@ -70,7 +82,6 @@ class KMeansHeadConfig(TypedDict):
     max_nodes: int
 
     num_layers: int
-    dropout: float
 
     # In: mask, features; Out: weighted_features
     weighting_module: nn.Module
@@ -80,9 +91,8 @@ class KMeansHeadConfig(TypedDict):
     mask_module: nn.Module
 
     act: str
-    norm: str
-    norm_kwargs: Dict[str, Any]
     act_kwargs: Dict[str, Any]
+    dropout: float
 
 
 class KMeansHead(nn.Module):
@@ -126,57 +136,11 @@ class KMeansHead(nn.Module):
             config["node_count"], 
             "Mask module"
         )
-
         self.act = activation_resolver(config["act"], **config["act_kwargs"])
-        self.norm = normalization_resolver(config["norm"], **config["norm_kwargs"])
+        self.dropout = config["dropout"]
 
 
-    def forward(self, k_data: KMeansCarry, batch_size: Optional[int] = None):
-        """
-        Forward pass for KMeansHead.
-        
-        Args:
-            k_data: KMeansCarry object containing nodes, mask, none_selected, and edge_index
-            batch_size: Optional batch size. If provided and positive, assumes batching along dimension 0
-            
-        Returns:
-            KMeansCarry object with updated mask
-        """
-        # Handle batching: if batch_size is provided and positive, process each batch separately
-        if batch_size is not None and batch_size > 0:
-            # Reshape for batch processing
-            nodes = k_data.nodes.view(batch_size, -1, k_data.nodes.shape[-1])
-            mask = k_data.mask.view(batch_size, -1, k_data.mask.shape[-1])
-            none_selected = k_data.none_selected.view(batch_size, -1)
-            
-            # Use vmap for parallel processing across batches
-            def process_batch(batch_nodes, batch_mask, batch_none_selected):
-                batch_k_data = KMeansCarry(
-                    nodes=batch_nodes,
-                    mask=batch_mask,
-                    none_selected=batch_none_selected,
-                    edge_index=k_data.edge_index
-                )
-                return self._forward_single(batch_k_data)
-            
-            # Apply vmap for parallel processing
-            batch_outputs = torch.vmap(process_batch)(nodes, mask, none_selected)
-            
-            # Extract results from batched outputs
-            output_nodes = torch.stack([out.nodes for out in batch_outputs], dim=0)
-            output_mask = torch.stack([out.mask for out in batch_outputs], dim=0)
-            output_none_selected = torch.stack([out.none_selected for out in batch_outputs], dim=0)
-            
-            return KMeansCarry(
-                nodes=output_nodes,
-                mask=output_mask,
-                none_selected=output_none_selected,
-                edge_index=k_data.edge_index
-            )
-        else:
-            return self._forward_single(k_data)
-    
-    def _forward_single(self, k_data: KMeansCarry):
+    def forward(self, k_data: KMeansCarry, mask_idx: int, batch: Optional[Tensor] = None) -> Tensor:
         """
         Forward pass for a single sample (no batching).
         
@@ -186,19 +150,15 @@ class KMeansHead(nn.Module):
         Returns:
             KMeansCarry object with updated mask
         """
-        masked_features = k_data.nodes * k_data.mask
-        
-        weighted_features = self.weighting_module(masked_features, k_data.edge_index)
-        center_mask = self.center_module(weighted_features, k_data.edge_index)
-        output_mask = self.mask_module(center_mask, weighted_features, k_data.edge_index)
-        output_mask = self.norm(output_mask)
+        # Process through the three modules
+        mask_weighting = self.weighting_module(k_data, mask_idx, batch)
+        center_nodes, center_batch = self.center_module(k_data, mask_idx, mask_weighting, batch)
+        output_mask = self.mask_module(k_data, mask_idx, center_nodes, batch, center_batch)
 
-        if self.act is not None:
-            output_mask = self.act(output_mask)
-        if self.training and hasattr(self, 'dropout') and self.dropout is not None:
-            output_mask = self.dropout(output_mask)
+        if not output_mask.dtype == torch.bool:
+            output_mask=torch.gt(self.act(output_mask).squeeze(-1), 0).bool()
 
-        return KMeansCarry(nodes=k_data.nodes, mask=output_mask, none_selected=k_data.none_selected, edge_index=k_data.edge_index)
+        return output_mask
     
     def reset_parameters(self):
         """Reset parameters for all modules in KMeansHead"""
@@ -208,8 +168,6 @@ class KMeansHead(nn.Module):
             self.center_module.reset_parameters()
         if hasattr(self.mask_module, 'reset_parameters'):
             self.mask_module.reset_parameters()
-        if hasattr(self.norm, 'reset_parameters'):
-            self.norm.reset_parameters()
 
 
 class SpectralWeightingConfig(TypedDict):
@@ -241,7 +199,7 @@ class SpectralWeighting(nn.Module):
         # Create multiple ChebConv layers
         self.cheb_convs = nn.ModuleList()
         self.norms = nn.ModuleList()
-        self.dropouts = nn.ModuleList()
+        self.dropout = config["dropout"]
         
         # First layer: in_channels -> out_channels
         self.cheb_convs.append(ChebConv(
@@ -265,62 +223,30 @@ class SpectralWeighting(nn.Module):
         # Create normalization and dropout layers for each layer
         for _ in range(self.num_layers):
             self.norms.append(normalization_resolver(config["norm"], **config["norm_kwargs"]))
-            self.dropouts.append(nn.Dropout(config["dropout"]))
     
-    def forward(self, features: Tensor, edge_index: Tensor, batch_size: Optional[int] = None) -> Tensor:
+    def forward(self, k_data: KMeansCarry, mask_idx: int, batch: Optional[Tensor] = None) -> Tensor:
         """
-        Forward pass with mask-based filtering through multiple spectral layers.
+        Forward pass through multiple spectral layers.
         
         Args:
-            features: Node features tensor
-            edge_index: Edge connectivity [2, num_edges]
-            batch_size: Optional batch size. If provided and positive, assumes batching along dimension 0
+            masked_features: Node features with mask applied
+            edge_index: Edge connectivity tensor
+            batch: Batch assignment tensor for batched processing
             
         Returns:
             Weighted node features after processing through all layers
         """
-        # Handle batching: if batch_size is provided and positive, process each batch separately
-        if batch_size is not None and batch_size > 0:
-            # Reshape for batch processing
-            features_batched = features.view(batch_size, -1, features.shape[-1])
-            
-            # Use vmap for parallel processing across batches
-            def process_batch(batch_features):
-                return self._forward_single(batch_features, edge_index)
-            
-            # Apply vmap for parallel processing
-            return torch.vmap(process_batch)(features_batched)
-        else:
-            return self._forward_single(features, edge_index)
-    
-    def _forward_single(self, features: Tensor, edge_index: Tensor) -> Tensor:
-        """
-        Forward pass for a single sample (no batching) through multiple spectral layers.
-        
-        Args:
-            features: Node features tensor
-            edge_index: Edge connectivity [2, num_edges]
-            
-        Returns:
-            Weighted node features after processing through all layers
-        """
-        x = features
-        
+        x = k_data.masked_x(mask_idx)
         # Process through each layer
         for i in range(self.num_layers):
             # Apply Chebyshev spectral convolution
             x = self.cheb_convs[i](
-                x=features,
-                edge_index=edge_index,
-                edge_weight=None,
-                batch=None,
-                lambda_max=None
+                x=x,
+                edge_index=k_data.masked_edge_index(mask_idx)
             )
             
             if self.norms[i] is not None:
                 x = self.norms[i](x)
-            if self.training and self.dropouts[i] is not None:
-                x = self.dropouts[i](x)
         
         return x
     
@@ -385,41 +311,68 @@ class DiscreteMeanCenter(nn.Module):
             raise ValueError(f"Invalid distance metric: {distance_metric}. "
                            f"Must be one of ['euclidean', 'cosine', 'manhattan']")
     
-    def forward(self, weighted_features: Tensor) -> Tensor:
+    def forward(self, k_data: KMeansCarry, mask_idx: int, weighted_features: Tensor, batch: Optional[Tensor] = None) -> Tensor:
         """
         Calculate weighted mean and return mask for closest node.
         
         Args:
-            mask: Binary mask tensor (1 for nodes to include, 0 for nodes to exclude)
-            weighted_features: PyTorch Geometric Batch object containing weighted node features
+            k_data: KMeansCarry object containing clustering state
+            mask_idx: Index of the current mask being processed
+            weighted_features: Weighted node features tensor
+            batch: Batch assignment tensor for batched processing
             
         Returns:
             New mask tensor with closest node to mean set to 1, rest to 0
         """
-        # Calculate weighted mean (sum of masked features / sum of mask)
-        # Add small epsilon to avoid division by zero
-        epsilon = 1e-8
-        mask_sum = torch.sum(weighted_features) + epsilon
-        center = torch.sum(weighted_features, dim=0) / mask_sum
-        
-        # Calculate distances from all nodes to the center
-        distances = self.distance_module(weighted_features, center)
+        if batch is not None and hasattr(k_data, 'num_graphs'):
+            distances = torch.zeros(k_data.x.shape[0], dtype=torch.float, device=k_data.x.device)
+            for i in range(k_data.num_graphs):
+                data = k_data.get_example(i)
+                graph_weighted_features = weighted_features[data.mask[mask_idx]]
+                distances += self.distance(graph_weighted_features)
+        else:
+            distances = self.distance(weighted_features)
         
         # Find the node with minimum distance
-        closest_node_idx = torch.argmin(distances)
+        if batch is not None:
+            _, closest_idxs = scatter_min(torch.pow(distances, 2), batch)
+        else:
+            _, closest_idxs = scatter_min(torch.pow(distances, 2))
+
+        center_batch = None
+        if batch is not None:
+            center_batch = batch[closest_idxs]
         
-        # Use torch.zeros, to ensure the tensor is on the same device and with the same type as mask
-        center_mask = torch.zeros(weighted_features.size(), dtype=torch.bool, device=weighted_features.device)
-        center_mask[closest_node_idx] = 1
+        return k_data.x[closest_idxs], center_batch
+    
+    def distance(self, weighted_features: Tensor) -> Tensor:
+        """Process a single graph's features."""
+        # Calculate weighted mean (sum of weighted features / number of features)
+        epsilon = 1e-8
+        num_features = weighted_features.shape[0]
+        center = torch.sum(weighted_features, dim=0) / (num_features + epsilon)
         
-        return center_mask
+        # Calculate distances from all nodes to the center
+        if self.config["distance_metric"] == 'cosine':
+            # For cosine distance, we need different handling
+            features_norm = F.normalize(weighted_features, p=2, dim=1)
+            center_norm = F.normalize(center.unsqueeze(0), p=2, dim=1)
+            cosine_sim = torch.sum(features_norm * center_norm, dim=1)
+            distances = 1 - cosine_sim
+        else:
+            # For euclidean and manhattan
+            distances = self.distance_module(weighted_features, center.unsqueeze(0).expand_as(weighted_features))
+        
+        return distances
     
 
 
 class RadiusMaskConfig(TypedDict):
-    k: int
-    radius: float
+    max_num_neighbors: int
+    radius: int
     weighting_module: nn.Module
+    threshold: Optional[float]
+    node_dim: int
 
 
 class RadiusAttentionWeights(nn.Module):
@@ -434,45 +387,20 @@ class RadiusAttentionWeights(nn.Module):
 
         Args:
             config: Configuration dictionary containing:
-                k: Maximum number of nodes to include in the mask
+                max_num_neighbors: Maximum number of nodes to include in the mask
                 radius: Radius within which to search for nodes
                 weighting_module: Module to weight the features
         """
         super(RadiusAttentionWeights, self).__init__()
-        self.k = config["k"]
+        self.max_num_neighbors = config["max_num_neighbors"]
         self.radius = config["radius"]
+        self.threshold = config.get("threshold", 0.1)
 
         self.weighting_module = config["weighting_module"]
+
+        self._mask_linear = torch.nn.Linear(config["node_dim"], 1)
     
-    def forward(self, center_mask: Tensor, features: Tensor, edge_index: Tensor, batch_size: Optional[int] = None) -> Tensor:
-        """
-        Find nodes within radius from center nodes and return a new mask.
-        
-        Args:
-            center_mask: Binary mask tensor indicating center nodes (1 for center, 0 otherwise)
-            features: Node features tensor
-            edge_index: Edge connectivity tensor
-            batch_size: Optional batch size. If provided and positive, assumes batching along dimension 0
-            
-        Returns:
-            New mask tensor with nodes within radius set to 1, rest to 0
-        """
-        # Handle batching: if batch_size is provided and positive, process each batch separately
-        if batch_size is not None and batch_size > 0:
-            # Reshape for batch processing
-            center_mask_batched = center_mask.view(batch_size, -1)
-            features_batched = features.view(batch_size, -1, features.shape[-1])
-            
-            # Use vmap for parallel processing across batches
-            def process_batch(batch_center_mask, batch_features):
-                return self._forward_single(batch_center_mask, batch_features, edge_index)
-            
-            # Apply vmap for parallel processing
-            return torch.vmap(process_batch)(center_mask_batched, features_batched)
-        else:
-            return self._forward_single(center_mask, features, edge_index)
-    
-    def _forward_single(self, center_mask: Tensor, features: Tensor, edge_index: Tensor) -> Tensor:
+    def forward(self, k_data: KMeansCarry, mask_idx: int, center: Tensor, batch: Optional[Tensor] = None, center_batch: Optional[Tensor] = None) -> Tensor:
         """
         Forward pass for a single sample (no batching).
         
@@ -484,25 +412,45 @@ class RadiusAttentionWeights(nn.Module):
         Returns:
             New mask tensor with nodes within radius set to 1, rest to 0
         """
-        center_features = features[center_mask]
+
+        if center.shape[0] == 0:
+            # No center nodes, return empty mask
+            return k_data.mask[mask_idx]
         
         # Use radius function to find neighbors
         # x: all node features, y: center node features
-        assign_index = radius(features, center_features, self.radius, max_num_neighbors=self.k)
+        row, col = radius(x=k_data.x, y=center, r=self.radius, batch_x=batch, batch_y=center_batch, max_num_neighbors=self.max_num_neighbors)
         
         # Create new mask
-        new_mask = torch.zeros(center_mask.size(), dtype=center_mask.dtype, device=center_mask.device)
+        new_mask_idx_pre = torch.unique(torch.stack([row, col], dim=0))
+        arange_idx = torch.arange(k_data.x.shape[0], device=k_data.x.device)
+        new_mask_idx = torch.isin(arange_idx, new_mask_idx_pre)
         
-        neighbor_indices = assign_index[0]
+        k_data_c_edge_index, k_data_c_edge_attr = subgraph(col, k_data.edge_index, k_data.edge_attr)
         
-        new_mask = self.weighting_module(features[neighbor_indices])
+        # Apply weighting module if available       
+        sig = inspect.signature(self.weighting_module.forward)
+
+        if 'batch' in sig.parameters:
+            weighting = self.weighting_module(k_data.x, edge_index=k_data_c_edge_index, edge_attr=k_data_c_edge_attr, batch=batch)
+        else:
+            weighting = self.weighting_module(k_data.x, edge_index=k_data_c_edge_index, edge_attr=k_data_c_edge_attr) 
+
+        w = self._mask_linear(weighting)
+        w = F.relu(w)
+        w = w.squeeze(-1)
+
+        assert w.shape == new_mask_idx.shape, f"Weighting and new mask index shape mismatch, got {w.shape} and {new_mask_idx.shape}"
+
+        new_mask_idx = torch.logical_and(new_mask_idx, torch.gt(w, self.threshold))
         
-        return new_mask
+        return new_mask_idx
     
     def reset_parameters(self):
         """Reset parameters for weighting module"""
         if hasattr(self.weighting_module, 'reset_parameters'):
             self.weighting_module.reset_parameters()
+        self._mask_linear.reset_parameters()
 
 class KMeansConfig(TypedDict):
     k: int
@@ -559,80 +507,46 @@ class KMeans(nn.Module):
             return masks.t()
         raise ValueError(f"Expected masks with shape [num_nodes, k] or [k, num_nodes], got {tuple(masks.shape)}")
 
-    def forward(self, kmeans_carry: KMeansCarry, batch_size: Optional[int] = None) -> KMeansCarry:
+    def forward(self, kmeans_carry: KMeansCarry, batch: Optional[Tensor] = None) -> KMeansCarry:
         """
         Args:
             kmeans_carry: KMeansCarry object containing nodes, mask, none_selected, and edge_index
-            batch_size: Optional batch size. If provided and positive, assumes batching along dimension 0
+            batch: Batch assignment tensor for batched processing
         Returns:
             KMeansCarry object with updated mask
         """
-        # Handle batching: if batch_size is provided and positive, process each batch separately
-        if batch_size is not None and batch_size > 0:
-            # Reshape for batch processing
-            nodes = kmeans_carry.nodes.view(batch_size, -1, kmeans_carry.nodes.shape[-1])
-            mask = kmeans_carry.mask.view(batch_size, -1, kmeans_carry.mask.shape[-1])
-            none_selected = kmeans_carry.none_selected.view(batch_size, -1)
-            
-            # Use vmap for parallel processing across batches
-            def process_batch(batch_nodes, batch_mask, batch_none_selected):
-                batch_kmeans_carry = KMeansCarry(
-                    nodes=batch_nodes,
-                    mask=batch_mask,
-                    none_selected=batch_none_selected,
-                    edge_index=kmeans_carry.edge_index
-                )
-                return self._forward_single(batch_kmeans_carry)
-            
-            # Apply vmap for parallel processing
-            batch_outputs = torch.vmap(process_batch)(nodes, mask, none_selected)
-            
-            # Extract results from batched outputs
-            output_nodes = torch.stack([out.nodes for out in batch_outputs], dim=0)
-            output_mask = torch.stack([out.mask for out in batch_outputs], dim=0)
-            output_none_selected = torch.stack([out.none_selected for out in batch_outputs], dim=0)
-            
-            return KMeansCarry(
-                nodes=output_nodes,
-                mask=output_mask,
-                none_selected=output_none_selected,
-                edge_index=kmeans_carry.edge_index
-            )
-        else:
-            return self._forward_single(kmeans_carry)
-    
-    def _forward_single(self, kmeans_carry: KMeansCarry) -> KMeansCarry:
-        """
-        Forward pass for a single sample (no batching).
+        num_nodes = kmeans_carry.x.shape[0]
         
-        Args:
-            kmeans_carry: KMeansCarry object containing nodes, mask, none_selected, and edge_index
-        Returns:
-            KMeansCarry object with updated mask
-        """
-        num_nodes = kmeans_carry.nodes.shape[1]
-        
-        masks_i = [head(k_carry) for head, k_carry in zip(self.heads, kmeans_carry.as_list())]
-        mask_tensor = torch.stack(masks_i, dim=1)  # [num_nodes, k]
+        # Create individual carries for each cluster/head
+        head_results = [head(kmeans_carry, idx, batch=batch) for idx, head in enumerate(self.heads)]
+        mask_tensor = torch.stack(head_results, dim=-1)  # [num_nodes, k]
 
         # Only consider weights strictly greater than threshold
         above_thresh = torch.greater(mask_tensor, self.thresh)
-        masked_weights = kmeans_carry.nodes.unsqueeze(-1).masked_fill(~above_thresh, float("-inf"))
+        masked_weights = kmeans_carry.x.norm(dim=1, keepdim=True).expand(-1, self.k).masked_fill(~above_thresh, float("-inf"))
 
-        top_vals, top_idx = torch.topk(masked_weights, k=self.max_overlap, dim=1)
+        top_vals, top_idx = torch.topk(masked_weights, k=min(self.max_overlap, self.k), dim=1)
         valid = torch.isfinite(top_vals)
 
-        row_idx = torch.arange(num_nodes, device=kmeans_carry.nodes.device).unsqueeze(1).expand_as(top_idx)
+        # Create final mask tensor
+        final_mask = torch.zeros_like(mask_tensor)
+        row_idx = torch.arange(num_nodes, device=kmeans_carry.x.device).unsqueeze(1).expand_as(top_idx)
         row_idx_valid = row_idx[valid]
         col_idx_valid = top_idx[valid]
-        mask_tensor[row_idx_valid, col_idx_valid] = 1
+        final_mask[row_idx_valid, col_idx_valid] = 1
 
-        none_selected = torch.zeros(num_nodes, device=kmeans_carry.nodes.device, dtype=mask_tensor.dtype)
         # Optional extra cluster for nodes not assigned to any mask
+        none_selected = torch.zeros(num_nodes, device=kmeans_carry.x.device, dtype=torch.bool)
         if self.excluded_is_cluster:
-            none_selected = mask_tensor.sum(dim=1) == 0
+            none_selected = final_mask.sum(dim=1) == 0
 
-        return KMeansCarry(nodes=kmeans_carry.nodes, mask=mask_tensor, none_selected=none_selected, edge_index=kmeans_carry.edge_index)
+        return KMeansCarry(
+            x=kmeans_carry.x,
+            edge_index=kmeans_carry.edge_index,
+            batch=kmeans_carry.batch,
+            mask=final_mask,
+            none_selected=none_selected
+        )
 
 
 
@@ -660,6 +574,12 @@ class VGAEEncoder(nn.Module):
             for _ in range(layers - 2):
                 self.convs.append(GATConv(hidden_dim, hidden_dim // 8, heads=8, dropout=dropout))
             self.convs.append(GATConv(hidden_dim, latent_dim, heads=1, dropout=dropout))
+        elif encoder_type == "cheb":
+            self.convs = nn.ModuleList()
+            self.convs.append(ChebConv(input_dim, hidden_dim, K=3))
+            for _ in range(layers - 2):
+                self.convs.append(ChebConv(hidden_dim, hidden_dim, K=3))
+            self.convs.append(ChebConv(hidden_dim, latent_dim, K=3))
         else:
             raise ValueError(f"Unsupported encoder type: {encoder_type}")
         
@@ -669,47 +589,25 @@ class VGAEEncoder(nn.Module):
         for conv in self.convs:
             conv.reset_parameters()
         
-    def forward(self, x: Tensor, edge_index: Tensor, batch_size: Optional[int] = None) -> Tuple[Tensor, Tensor]:
+    def forward(self, x: Tensor, edge_index: Tensor, batch: Optional[Tensor] = None) -> Tuple[Tensor, Tensor]:
         """
         Forward pass returning mu and logstd
         
         Args:
             x: Node features tensor
             edge_index: Edge connectivity tensor
-            batch_size: Optional batch size. If provided and positive, assumes batching along dimension 0
+            batch: Batch assignment tensor for batched processing
         """
-        # Handle batching: if batch_size is provided and positive, process each batch separately
-        if batch_size is not None and batch_size > 0:
-            # Reshape for batch processing
-            x_batched = x.view(batch_size, -1, x.shape[-1])
-            
-            # Use vmap for parallel processing across batches
-            def process_batch(batch_x):
-                return self._forward_single(batch_x, edge_index)
-            
-            # Apply vmap for parallel processing
-            batch_results = torch.vmap(process_batch)(x_batched)
-            
-            # Extract mu and logstd from results
-            mu = torch.stack([result[0] for result in batch_results], dim=0)
-            logstd = torch.stack([result[1] for result in batch_results], dim=0)
-            
-            return mu, logstd
-        else:
-            return self._forward_single(x, edge_index)
-    
-    def _forward_single(self, x: Tensor, edge_index: Tensor) -> Tuple[Tensor, Tensor]:
-        """Forward pass for a single sample (no batching) returning mu and logstd"""
+        # PyTorch Geometric convolutions handle batching automatically via the data structure
         for i, conv in enumerate(self.convs[:-1]):
             x = conv(x, edge_index)
             x = F.relu(x)
-            x = F.dropout(x, p=self.dropout, training=self.training)
+            if self.training and self.dropout is not None:
+                x = F.dropout(x, p=self.dropout)
         
         # Final layer for mean (mu)
         mu = self.convs[-1](x, edge_index)
-        
-        # For logstd, we use the same architecture but with different weights
-        # In practice, you might want to share some layers between mu and logstd
+
         logstd = mu  # Simplified: using same output for logstd
         
         return mu, logstd
@@ -757,41 +655,63 @@ class OutputHead(nn.Module):
         else:
             raise ValueError(f"Unsupported pooling type: {self.pooling_type}")
         
-        # Linear layers
-        self.linear1 = nn.Linear(self.node_dim, self.hidden_dim)
-        self.linear2 = nn.Linear(self.hidden_dim, self.output_dim)
+        self.linear1 = Linear(self.node_dim, self.hidden_dim)
+        self.linear2 = Linear(self.hidden_dim, self.output_dim)
         
-        # Normalization and activation
+        # Normalisierung und Aktivierung
         self.norm = normalization_resolver(config["norm"], **config["norm_kwargs"])
+        # Make BatchNorm safe for batch size 1 during training
+        try:
+            from torch_geometric.nn.norm import BatchNorm as PyGBatchNorm  # type: ignore
+        except Exception:
+            PyGBatchNorm = None  # type: ignore
+        if PyGBatchNorm is not None and isinstance(self.norm, PyGBatchNorm):
+            if hasattr(self.norm, 'allow_single_element'):
+                self.norm.allow_single_element = True  # type: ignore[attr-defined]
+        # Fallback: if using torch.nn.BatchNorm1d, prefer LayerNorm to avoid N=1 error
+        if isinstance(self.norm, nn.BatchNorm1d):
+            self.norm = nn.LayerNorm(self.hidden_dim)
         self.act = activation_resolver(config["act"], **config["act_kwargs"])
     
-    def forward(self, kmeans_carry: KMeansCarry, batch_size: Optional[int] = None) -> Tensor:
+    def forward(self, kmeans_carry: KMeansCarry, batch: Optional[Tensor] = None) -> Tensor:
         """
         Forward pass for output head.
         
         Args:
             kmeans_carry: KMeansCarry object containing nodes and edge_index
+            batch: Batch assignment tensor for batched processing
             
         Returns:
-            Output tensor of shape [output_dim]
+            Output tensor of shape [batch_size, output_dim] if batched, [output_dim] if single graph
         """
-        nodes = kmeans_carry.nodes
-        edge_index = kmeans_carry.edge_index
+        nodes = kmeans_carry.x
         
         # Apply graph pooling
-        if self.pooling_type == "attention":
-            pooled = self.pooling(nodes, batch=None)
-        else:
-            pooled = self.pooling(nodes, batch=None)
+        # PyTorch Geometric pooling functions handle batch automatically
+
         
+        pooled = self.pooling(nodes, batch=batch)
+        
+        #TODO - for each pool
         # Apply linear layers with normalization and activation
         x = self.linear1(pooled)
         if self.norm is not None:
-            x = self.norm(x)
+            # Safe normalization for batch size 1 during training
+            try:
+                from torch_geometric.nn.norm import BatchNorm as PyGBatchNorm  # type: ignore
+            except Exception:
+                PyGBatchNorm = None  # type: ignore
+            if isinstance(self.norm, nn.BatchNorm1d) or (PyGBatchNorm is not None and isinstance(self.norm, PyGBatchNorm)):
+                if self.training and x.shape[0] <= 1:
+                    # Fallback to LayerNorm behavior to avoid BN crash at N=1
+                    x = F.layer_norm(x, (x.shape[-1],))
+                else:
+                    x = self.norm(x)
+            else:
+                x = self.norm(x)
         if self.act is not None:
             x = self.act(x)
         x = self.linear2(x)
-        
         return x
     
     def reset_parameters(self):
@@ -807,6 +727,7 @@ class KMeansHRMInnerModuleConfig(TypedDict):
     add_self_loops: bool
     dropout: float
     hidden_dim: int
+    edge_dim: int
     node_dim: int
     layers: int
 
@@ -821,12 +742,12 @@ class KMeansHRMInnerModuleConfig(TypedDict):
     halt_exploration_prob: float
 
 
-    vgae_encoder_type: str = "gcn"  # "gcn", "gat", "custom"
-    vgae_latent_dim: int = 64
-    vgae_encoder_layers: int = 2
-    vgae_encoder_dropout: float = 0.1
-    vgae_decoder_type: Optional[str] = None  # None for InnerProductDecoder, "custom" for custom decoder
-    vgae_kl_weight: float = 1.0  # Weight for KL divergence loss
+    vgae_encoder_type: str
+    vgae_latent_dim: int
+    vgae_encoder_layers: int
+    vgae_encoder_dropout: float
+    vgae_decoder_type: Optional[str]
+    vgae_kl_weight: float
 
     
 
@@ -842,6 +763,9 @@ class KMeansHRMInnerModule(nn.Module):
         self.hidden_dim = self.config['hidden_dim']
         self.node_dim = self.config['node_dim']
         self.layers = self.config['layers']
+        self.edge_dim = self.config['edge_dim']
+
+        self.latent_dim = self.config['vgae_latent_dim']
 
         self.kmeans_config = self.config['kmeans_config']
         self.k = self.kmeans_config['k']
@@ -863,13 +787,37 @@ class KMeansHRMInnerModule(nn.Module):
 
         self.kmeans_module = KMeans(self.kmeans_config, training=training)
 
+        prevgae_attention_layers = []
+        prevgae_attention_layers.append(torch.nn.Linear(self.edge_dim, self.hidden_dim))
+        prevgae_attention_layers.append(torch.nn.ReLU())
+        for _ in range(max(0, self.layers-2)):
+            prevgae_attention_layers.append(torch.nn.Linear(self.hidden_dim, self.hidden_dim))
+            prevgae_attention_layers.append(torch.nn.ReLU())
+        prevgae_attention_layers.append(torch.nn.Linear(self.hidden_dim, self.node_dim * self.hidden_dim))
+        self.prevgae_attention_layers = nn.Sequential(*prevgae_attention_layers)
+
+        self.encode_conv = NNConv(
+            in_channels=self.node_dim,
+            out_channels=self.hidden_dim,
+            nn=self.prevgae_attention_layers,
+            aggr='mean'
+        )
+
+        self.linear_post_attention = nn.Sequential(
+            nn.Linear(self.latent_dim, self.node_dim * 8),
+            nn.ReLU(),
+            (nn.Dropout(self.dropout if training else 0.0)),
+            nn.Linear(self.node_dim * 8, self.node_dim),
+            nn.LayerNorm(self.node_dim)
+        )
+        
         # Initialize VGAE if configured
         self.vgae_encoder = VGAEEncoder(
-            input_dim=self.node_dim,  # Assuming node features dimension
+            input_dim=self.hidden_dim,  # Assuming node features dimension
             hidden_dim=self.hidden_dim,
-            latent_dim=self.config['vgae_latent_dim'],
+            latent_dim=self.latent_dim,
             layers=self.config['vgae_encoder_layers'],
-            dropout=self.config['vgae_encoder_dropout'] if training else None,
+            dropout=self.config['vgae_encoder_dropout'] if training else 0.0,
             encoder_type=self.config['vgae_encoder_type']
         )
         
@@ -883,38 +831,10 @@ class KMeansHRMInnerModule(nn.Module):
             encoder=self.vgae_encoder,
             decoder=decoder
         )
-            
-        # Standard attention layers (GAT)
-        self.attention_layers = nn.ModuleList()
-        for _ in range(self.layers):
-            self.attention_layers.append(
-                ChebConv(
-                    in_channels=self.node_dim,
-                    out_channels=self.node_dim//8,
-                    heads=8,
-                    dropout=self.dropout if training else None
-                )
-            )
-        
-        self.linear_post_attention = nn.Sequential(
-            nn.Linear((self.node_dim//8)*8, self.node_dim*8),
-            nn.ReLU(),
-            (nn.Dropout(self.dropout) if training else None),
-            nn.Linear(self.node_dim*8, self.node_dim),
-            nn.LayerNorm(self.node_dim)
-        )
 
         channels = self.k
         if self.excluded_is_cluster:
             channels += 1
-        
-        self.mini_attention_pool = nn.Sequential(
-            nn.Linear(channels, self.hidden_dim),
-            nn.ReLU(),
-            (nn.Dropout(self.dropout) if training else None),
-            nn.Linear(self.hidden_dim, 1),
-            nn.Sigmoid()
-        )
         
         self.norm = LayerNorm(self.node_dim)
         self.dropout_layer = nn.Dropout(self.dropout)
@@ -923,16 +843,19 @@ class KMeansHRMInnerModule(nn.Module):
         self.policy_module = OutputHead(self.policy_module_config, training=training)
 
     def reset_parameters(self):
-        """Reset parameters for all modules in KMeansHRMInnerModule"""
+        """Reset parameters for all modules in 83Module"""
         self.kmeans_module.reset_parameters()
         self.vgae_encoder.reset_parameters()
         self.vgae.reset_parameters()
-        for layer in self.attention_layers:
-            layer.reset_parameters()
-        self.linear_post_attention.reset_parameters()
-        self.norm.reset_parameters()
-        self.dropout_layer.reset_parameters()
-        self.mini_attention_pool.reset_parameters()
+        if hasattr(self.prevgae_attention_layers, 'reset_parameters'):
+            self.prevgae_attention_layers.reset_parameters()
+        # Reset linear layers and norms safely
+        for module in self.linear_post_attention:
+            if hasattr(module, 'reset_parameters'):
+                module.reset_parameters()
+        if hasattr(self.norm, 'reset_parameters'):
+            self.norm.reset_parameters()
+        # Dropout has no parameters to reset
         self.output_head.reset_parameters()
         self.policy_module.reset_parameters()
         
@@ -942,13 +865,6 @@ class KMeansHRMInnerModule(nn.Module):
         if hasattr(self, 'puzzle_embedding'):
             self.puzzle_embedding.reset_parameters()
     
-
-
-    def _mini_attention_pool(self, nodes: Tensor) -> Tensor:
-        per_feature_attention = torch.vmap(self.mini_attention_pool, dim=0)(nodes)
-        pool_filtered_nodes = torch.sum(torch.where(per_feature_attention > 0.5, nodes, 0), dim=0)
-        pool_filtered_nodes = self.norm(pool_filtered_nodes)
-        return pool_filtered_nodes
     
     def _link_subgraph_to_nodes(self, input_embeddings: Tensor, kmeans_nodes: Tensor, kmeans_edge_index: Tensor) -> Tuple[Tensor, Tensor]:
         """
@@ -963,128 +879,188 @@ class KMeansHRMInnerModule(nn.Module):
             Tuple of (bipartite_edge_index, kmean_offset_edges)
         """
         kmean_offset_edges = kmeans_edge_index.shape[1] + input_embeddings.shape[1]
-        bipartite_edge_index, _ = bipartite_subgraph(input_embeddings, kmeans_nodes)
+        bipartite_edge_index = bipartite_subgraph(input_embeddings, kmeans_nodes)[0]
         if self.training:
             bipartite_edge_index, _ = dropout_edge(bipartite_edge_index, p=self.dropout)
         return bipartite_edge_index, kmean_offset_edges
-    
-    def _forward_per_subgraph(self,
+        
+    def _forward_per_subgraph(self, 
+            x: Tensor,
+            edge_index: Tensor,
             input_nodes: Tensor,
-            input_edge_index: Tensor,
-            kmeans_nodes: Tensor,
-            kmeans_edge_index: Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+            input_edges: Tensor,
+            input_edge_attr: Tensor,
+            batch: Optional[Tensor] = None
+        ) -> Tensor:
+        """
+        Forward pass for a single subgraph with proper batching.
+        
+        Args:
+            x: Subgraph node features
+            edge_index: Subgraph edge connectivity
+            input_nodes: Global input node features
+            input_edges: Global input edge connectivity
+            input_edge_attr: Global input edge attributes
+            batch: Batch assignment for the subgraph nodes
+        """
+        # Combine input nodes with subgraph nodes
+        total_nodes = torch.cat([input_nodes, x], dim=0)
+        
+        # Adjust edge indices: input edges stay as-is, subgraph edges are offset
+        offset_subgraph_edges = torch.add(edge_index, input_nodes.shape[0])
+        combined_edge_index = torch.cat([input_edges, offset_subgraph_edges], dim=1)
 
-        linked_edge_index, new_kmeans_edges = self._link_subgraph_to_nodes(input_nodes, kmeans_nodes, kmeans_edge_index)
-        if self.add_self_loops:
-            linked_edge_index, _ = add_self_loops(linked_edge_index)
-        if self.training:
-            linked_edge_index, _ = dropout_edge(linked_edge_index, p=self.dropout)
+        synthetic_edge_attr = torch.zeros(edge_index.shape[1], input_edge_attr.shape[1], dtype=input_edge_attr.dtype, device=input_edge_attr.device)
+        combined_edge_attr = torch.cat([input_edge_attr, synthetic_edge_attr], dim=0)
+        
+        # Create batch tensor for the combined graph
+        if batch is not None:
+            num_input_nodes = input_nodes.shape[0]
+            num_subgraph_nodes = x.shape[0]
+            
+            # Input nodes belong to all batches - we assign them to batch 0 for simplicity
+            # but they will be shared across all subgraphs in the actual processing
+            input_batch = torch.zeros(num_input_nodes, dtype=batch.dtype, device=batch.device)
+            
+            # Subgraph nodes keep their original batch assignment
+            combined_batch = torch.cat([input_batch, batch], dim=0)
+        else:
+            combined_batch = None
 
-        total_nodes = torch.cat([input_nodes, kmeans_nodes], dim=0)
-        total_edges = torch.cat([input_edge_index, new_kmeans_edges, linked_edge_index], dim=1)
+        total_nodes = self.encode_conv(total_nodes, combined_edge_index, edge_attr=combined_edge_attr)
 
-        new_nodes, new_edges = self.vgae(total_nodes, total_edges)
-        new_nodes = new_nodes[input_nodes.shape[0]:]
-        new_edges, _ = subgraph(torch.arange(input_nodes.shape[0], total_nodes.shape[0]), new_edges)
-
-        # Apply attention layers
-        for layer in self.attention_layers:
-            new_nodes = layer(new_nodes, new_edges)
-        new_nodes = self.linear_post_attention(new_nodes)
-
-        new_nodes = self.norm(new_nodes)
-        if self.dropout and self.training:
-            new_nodes = self.dropout(new_nodes)
-        return new_nodes, new_edges, new_kmeans_edges
-
+        # Encode through VGAE
+        total_nodes = self.vgae(total_nodes, combined_edge_index, batch=combined_batch)[0]
+    
+        subgraph_nodes = total_nodes[input_nodes.shape[0]:]
+        
+        subgraph_nodes = self.linear_post_attention(subgraph_nodes)
+        subgraph_nodes = self.norm(subgraph_nodes)
+        
+        if self.training and hasattr(self, 'dropout_layer'):
+            subgraph_nodes = self.dropout_layer(subgraph_nodes)
+        return subgraph_nodes
+    
     def _forward_per_graph(self, 
             kmeans_carry: KMeansCarry,
-            input_nodes: Tensor,
-            input_edges: Tensor
-        ) -> Tuple[torch.Tensor, torch.Tensor]:
+            inputs: Data,
+            batch: Optional[Tensor] = None
+        ) -> Tensor:
         """
-        Forward pass for a single graph.
+        Forward pass for graphs with iterative processing over masks.
+        
+        Args:
+            kmeans_carry: KMeansCarry object containing clustering state
+            inputs: Input graph data containing global context
+            batch: Batch assignment tensor (handled by PyTorch Geometric)
+            
+        Returns:
+            Updated node features after processing subgraphs
         """
-        subgraphs, subgraphs_edge_indices = kmeans_carry.get_subgraphs(include_none_selected=self.excluded_is_cluster)
+        k = kmeans_carry.k
+        if k == 0:
+            return torch.zeros_like(kmeans_carry.x)
+        
+        # Collect features from all masks
+        inputs_feats = []
+        all_subgraph_features = []
+        
+        for mask_idx in range(k):
+            # Get masked features and edges for this specific mask
+            masked_x = kmeans_carry.masked_x(mask_idx)
+            masked_edge_index = kmeans_carry.masked_edge_index(mask_idx)
+            
+            # Process through subgraph
+            inputs_feats.append((masked_x, masked_edge_index, batch))
 
-        # Use vmap for parallel processing across subgraphs
-        new_node_sets = torch.vmap(self._forward_per_subgraph, dim=0)(
-            subgraphs, 
-            subgraphs_edge_indices, 
-            input_nodes.unsqueeze(0), 
-            input_edges.unsqueeze(0)
-        )
+        all_subgraph_features = [self._forward_per_subgraph(x=masked_x, edge_index=masked_edges, input_nodes=inputs.x, input_edges=inputs.edge_index, input_edge_attr=inputs.edge_attr, batch=batch) for masked_x, masked_edges, batch in inputs_feats]
+        
+        # Stack and pool features across all subgraphs
+        if all_subgraph_features:
+            stacked_features = torch.stack(all_subgraph_features, dim=-1)  # [k, num_nodes, features]
+            pooled_features = torch.mean(stacked_features, dim=-1)  # Average across k dimension
+        else:
+            pooled_features = torch.zeros_like(kmeans_carry.x)
+        
+        # Update kmeans_carry in place
+        kmeans_carry.x = pooled_features
+        
+        return pooled_features
+    
 
-        new_node_set = torch.vmap(self._mini_attention_pool, dim=1)(new_node_sets)
-        return new_node_set
-
-    def empty_carry(self, num_nodes: int, node_dim: int, device: torch.device = DEVICE, batch_size: Optional[int] = None) -> KMeansCarry:
+    def empty_carry(self, num_nodes: int, node_dim: int, device: torch.device = DEVICE, batch: Optional[Tensor] = None) -> KMeansCarry:
         """
         Create an empty KMeansCarry for initialization.
         
         Args:
-            batch_size: Number of batches
-            num_nodes: Number of nodes in the graph
+            num_nodes: Number of nodes in the graph (total for all graphs if batched)
             node_dim: Dimension of node features
             device: Device to create tensors on
+            batch: Batch assignment tensor if batched
             
         Returns:
             Empty KMeansCarry object
         """
         if device is None:
             device = DEVICE
-
-        if batch_size is None or batch_size <= 0:
-            batch_size = 1
             
         # Create empty tensors
-        nodes = torch.empty(batch_size, num_nodes, node_dim, dtype=torch.float32, device=device)
-        mask = torch.zeros(batch_size, num_nodes, self.k, dtype=torch.float32, device=device)
-        none_selected = torch.zeros(batch_size, num_nodes, dtype=torch.bool, device=device)
-        edge_index = torch.empty(batch_size, 2, 0, dtype=torch.long, device=device)
+        x = torch.zeros(num_nodes, node_dim, dtype=torch.float32, device=device)
+        mask = torch.ones(num_nodes, self.k, dtype=torch.float32, device=device)
+        none_selected = torch.zeros(num_nodes, dtype=torch.bool, device=device)
+        edge_index = torch.empty(2, 0, dtype=torch.long, device=device)
         
-        return KMeansCarry(nodes=nodes, mask=mask, none_selected=none_selected, edge_index=edge_index)
+        return KMeansCarry(x=x, mask=mask, none_selected=none_selected, edge_index=edge_index, batch=batch)
     
     def reset_carry(self, reset_flag: torch.Tensor, carry: KMeansCarry) -> KMeansCarry:
         """
         Reset KMeansCarry based on reset flags.
         
         Args:
-            reset_flag: Boolean tensor indicating which samples to reset [batch_size]
+            reset_flag: Boolean tensor indicating which graphs to reset [batch_size]
             carry: Current KMeansCarry object
             
         Returns:
             Reset KMeansCarry object
         """
-        # Create initial values for reset
-        init_nodes = torch.zeros_like(carry.nodes)
-        init_mask = torch.zeros_like(carry.mask)
-        init_none_selected = torch.zeros_like(carry.none_selected)
-        init_edge_index = torch.empty_like(carry.edge_index)
-        
-        # Apply reset flag
-        reset_flag_nodes = reset_flag.view(-1, 1, 1, 1)
-        reset_flag_mask = reset_flag.view(-1, 1, 1)
-        reset_flag_none = reset_flag.view(-1, 1)
-        reset_flag_edge_index = reset_flag.view(-1, 1, 1)
-        
-        new_nodes = torch.where(reset_flag_nodes, init_nodes, carry.nodes)
-        new_mask = torch.where(reset_flag_mask, init_mask, carry.mask)
-        new_none_selected = torch.where(reset_flag_none, init_none_selected, carry.none_selected)
-        new_edge_index = torch.where(reset_flag_edge_index, init_edge_index, carry.edge_index)
-        
-        return KMeansCarry(
-            nodes=new_nodes,
-            mask=new_mask,
-            none_selected=new_none_selected,
-            edge_index=new_edge_index
-        )
+        if carry.batch is None:
+            # Single graph case
+            if reset_flag.item():
+                # Reset to initial state
+                return self.empty_carry(carry.x.shape[0], carry.x.shape[1], carry.x.device, carry.batch)
+            else:
+                return carry
+        else:
+            # Batched case
+            new_x = carry.x.clone()
+            new_mask = carry.mask.clone()
+            new_none_selected = carry.none_selected.clone()
+            
+            # For each graph that needs reset, reinitialize its nodes and mask
+            unique_batches = torch.unique(carry.batch)
+            for i, batch_idx in enumerate(unique_batches):
+                if i < len(reset_flag) and reset_flag[i]:
+                    # Reset this graph
+                    batch_mask = (carry.batch == batch_idx)
+                    num_nodes_in_graph = batch_mask.sum()
+                    
+                    # Reset features
+                    new_x[batch_mask] = torch.zeros_like(new_x[batch_mask])
+                    new_mask[batch_mask] = torch.ones_like(new_mask[batch_mask]) / self.k
+                    new_none_selected[batch_mask] = False
+            
+            return KMeansCarry(
+                x=new_x,
+                edge_index=carry.edge_index,
+                batch=carry.batch,
+                mask=new_mask,
+                none_selected=new_none_selected
+            )
 
     def forward(self, 
             kmeans_carry: KMeansCarry,
             inputs: Data,
-            batch_dim: Optional[int] = 0
+            batch: Optional[Tensor] = None
         ):
         """
         Forward pass following the HierarchicalReasoningModel pattern.
@@ -1092,40 +1068,54 @@ class KMeansHRMInnerModule(nn.Module):
         Args:
             kmeans_carry: KMeansCarry object containing current state
             inputs: Input graph data
-            batch_size: Batch size
             
         Returns:
-            Tuple of (output, policy_output)
+            Tuple of (new_carry, output, policy_output)
         """
-        # Forward iterations
+        # Forward iterations without gradients
+        current_carry = kmeans_carry
+        
         with torch.no_grad():
             for _H_step in range(self.K_cycles):
                 for _L_step in range(self.L_cycles):
                     if not ((_H_step == self.K_cycles - 1) and (_L_step == self.L_cycles - 1)):
-                        kmeans_carry.nodes = self._forward_per_graph(kmeans_carry, inputs, inputs.edge_index)
+                        # Update the node features based on current clustering
+                        new_features = self._forward_per_graph(current_carry, inputs, batch)
+                        current_carry = KMeansCarry(
+                            x=new_features,
+                            edge_index=current_carry.edge_index,
+                            mask=current_carry.mask,
+                            none_selected=current_carry.none_selected
+                        )
 
                 if not (_H_step == self.K_cycles - 1):
-                    kmeans_carry.mask = self.kmeans_module(kmeans_carry)
+                    current_carry = self.kmeans_module(current_carry, batch)
+        # Assertions for debugging
+        assert not current_carry.x.requires_grad, "x should not require grad (IFT)"
+        assert not current_carry.mask.requires_grad, "mask should not require grad (IFT)"
 
-        assert not kmeans_carry.nodes.requires_grad and not kmeans_carry.mask.requires_grad
-
-        # 1-step grad
-        kmeans_carry.nodes = self._forward_per_graph(kmeans_carry, inputs.x, inputs.edge_index)
-        kmeans_carry.mask = self.kmeans_module(kmeans_carry)
-
-        # Create new carry
-        new_carry = KMeansCarry(
-            nodes=kmeans_carry.nodes.detach(),
-            mask=kmeans_carry.mask.detach(),
-            none_selected=kmeans_carry.none_selected.detach(),
-            edge_index=kmeans_carry.edge_index.detach()
+        # 1-step with gradients
+        new_features = self._forward_per_graph(current_carry, inputs, batch)
+        current_carry = KMeansCarry(
+            x=new_features,
+            edge_index=current_carry.edge_index,
+            mask=current_carry.mask,
+            none_selected=current_carry.none_selected
         )
+        current_carry = self.kmeans_module(current_carry, batch)
 
-        # LM Outputs
-        output = self.output_head(new_carry)
-
-        # Q head (policy module)
-        q_logits = self.policy_module(new_carry).to(torch.float32)
+        # Create new carry for output
+        new_carry = KMeansCarry(
+            x=current_carry.x.detach(),
+            edge_index=current_carry.edge_index.detach(),
+            batch=current_carry.batch,
+            mask=current_carry.mask.detach(),
+            none_selected=current_carry.none_selected.detach()
+        )
+        
+        # Generate outputs
+        output = self.output_head(current_carry, batch)
+        q_logits = self.policy_module(current_carry, batch).to(torch.float32)
         
         return new_carry, output, (q_logits[..., 0], q_logits[..., 1])
 
@@ -1161,46 +1151,54 @@ class KMeansHRMModule(nn.Module):
 
         self.training = training
 
-    def initial_carry(self, batch: Data) -> KMeansCarry:
-        batch_size = batch.x.shape[0]
+    def initial_carry(self, batch: Batch) -> KMeansHRMInitialCarry:
+        num_nodes = batch.x.shape[0]  # Total nodes across all graphs
+        node_dim = batch.x.shape[1]   # Feature dimension
+        device = batch.x.device
+        
+        # Number of graphs in the batch
+        if hasattr(batch, 'num_graphs'):
+            num_graphs = batch.num_graphs
+        else:
+            num_graphs = len(torch.unique(batch.batch))
+
+        initial_inner_carry = self.inner_module.empty_carry(
+            num_nodes=num_nodes, 
+            node_dim=node_dim, 
+            device=device, 
+            batch=batch.batch
+        )
+
+        # Initialize with actual data
+        initial_inner_carry.x = batch.x.clone()
+        initial_inner_carry.edge_index = batch.edge_index.clone()
+        
         return KMeansHRMInitialCarry(
-            inner_carry=self.inner_module.empty_carry(batch_size),
-            steps=torch.zeros(batch_size, dtype=torch.int32, device=DEVICE),
-            halted=torch.zeros(batch_size, dtype=torch.int32, device=DEVICE),
+            inner_carry=initial_inner_carry,
+            steps=torch.zeros(num_graphs, dtype=torch.int32, device=device),
+            halted=torch.zeros(num_graphs, dtype=torch.bool, device=device),
             current_data=batch
         )
 
 
     def forward(self, 
             carry: KMeansHRMInitialCarry,
-            data: Data,
-        ) -> KMeansHRMOutput:
+            data: Batch,
+        ):
         """
         Forward pass with optional VGAE support.
         
         Returns:
-            Tuple of (updated_nodes, updated_edges)
+            Tuple of (updated_carry, output)
         """
-
         new_inner_carry = self.inner_module.reset_carry(carry.halted, carry.inner_carry)
         new_steps = torch.where(carry.halted, 0, carry.steps)
         
-        def create_filtered_data(new_data: Data) -> Data:
-            """Create new Data object with halted entries preserving old values"""
-            for key, new_value in new_data.__dict__.items():
-                if isinstance(new_value, Tensor) and hasattr(carry.current_data, key):
-                    old_value = getattr(carry.current_data, key)
-                    halt_mask = carry.halted.view((-1,))
-                    
-                    new_data[key] = torch.where(halt_mask, old_value, new_value)
-                else:
-                    new_data[key] = new_value
-            
-            return new_data
-        
-        new_current_data = create_filtered_data(data)
+        # For PyTorch Geometric batches, we don't need complex filtering
+        # as halted/reset is handled at the graph level in reset_carry
+        new_current_data = data
 
-        new_inner_carry, y_pred, (q_halt, q_continue) = self.inner_module(new_inner_carry, new_current_data)
+        new_inner_carry, y_pred, (q_halt, q_continue) = self.inner_module(new_inner_carry, new_current_data, new_current_data.batch)
 
         output = KMeansHRMOutput(
             y_pred=y_pred,
@@ -1219,7 +1217,9 @@ class KMeansHRMModule(nn.Module):
                 min_halt_steps = (torch.rand_like(q_halt) < self.explore_steps_prob) * torch.randint_like(new_steps, low=2, high=self.halt_max_steps)
                 halted = halted & (new_steps >= min_halt_steps)
 
-                output['target_q_policy'] = self.inner_module.policy_module(new_inner_carry.nodes, new_inner_carry.edge_index)[-1]
+                # Generate target policy for training
+                target_q_logits = self.inner_module.policy_module(new_inner_carry)
+                output['target_q_policy'] = (target_q_logits[..., 0], target_q_logits[..., 1])
         
         return KMeansHRMInitialCarry(inner_carry=new_inner_carry, steps=new_steps, halted=halted, current_data=new_current_data), output
     

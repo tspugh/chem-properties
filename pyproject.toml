@@ -21,4 +21,10 @@ dependencies = [
     "torch>=2.8.0",
     "torch-geometric>=2.6.1",
     "cuda-python<12.3",
+    "torch-scatter",
+    "torch-cluster>=1.6.3",
 ]
+
+[tool.uv.extra-build-dependencies]
+    torch-cluster = ["torch"]
+    torch-scatter = ["torch"]

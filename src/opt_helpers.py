@@ -3,7 +3,7 @@ from rdkit.Chem import rdDistGeom
 from rdkit.Chem.rdForceFieldHelpers import MMFFOptimizeMolecule
 from pyscf import gto, scf, semiempirical
 from pyscf.geomopt import geometric_solver
-from gpu4pyscf.dft import rks
+#from gpu4pyscf.dft import rks
 from typing import Tuple, Optional, List
 import time
 from multiprocessing import Pool, cpu_count
@@ -38,13 +38,22 @@ from data_gen_helpers import iterative_extend_smiles
 import pandas as pd
 
 def remove_asterisk(smiles):
-    return smiles.replace('*', '').replace('()', '')
-
-def create_gto_mol(smiles, basis_set='3-21g', add_hydrogen=True, opt=True):
-    mol = Chem.MolFromSmiles(remove_asterisk(smiles))
-    if mol is None:
-        raise RuntimeError("Molecule failed to generate from smiles")
+    # Remove asterisks and empty parentheses
+    cleaned = smiles.replace('*', '').replace('()', '')
     
+    # Remove leading stereochemistry descriptors that cause parse errors
+    # Handle patterns like /C=C/, \C=C\, etc. at the beginning
+    import re
+    # Remove leading stereochemistry patterns like /C=C/, \C=C\, /C=C\, etc.
+    cleaned = re.sub(r'^[/\\][^/\\]*[/\\]', '', cleaned)
+    
+    # Also remove any remaining leading / or \ characters
+    while cleaned.startswith('/') or cleaned.startswith('\\'):
+        cleaned = cleaned[1:]
+    
+    return cleaned
+
+def preoptimize_mol(mol, add_hydrogen=True, opt=True, max_steps=200):    
     if add_hydrogen:
         mol = Chem.AddHs(mol)
     
@@ -93,7 +102,7 @@ def create_gto_mol(smiles, basis_set='3-21g', add_hydrogen=True, opt=True):
     # UFF optimization
     if opt:
         try:
-            MMFFOptimizeMolecule(mol, maxIters=200)
+            MMFFOptimizeMolecule(mol, maxIters=max_steps)
         except Exception as e:
             print("Pre-optimization failed: ", e)
             pass  # Continue even if UFF fails
@@ -101,7 +110,13 @@ def create_gto_mol(smiles, basis_set='3-21g', add_hydrogen=True, opt=True):
     # Check if we have a valid conformer
     if mol.GetNumConformers() == 0:
         raise RuntimeError("No valid conformer")
+
+def create_gto_mol(smiles, basis_set='3-21g', add_hydrogen=True, opt=True, max_steps=200):
+    mol = Chem.MolFromSmiles(remove_asterisk(smiles))
+    if mol is None:
+        raise RuntimeError("Molecule failed to generate from smiles")
     
+    preoptimize_mol(mol, add_hydrogen=add_hydrogen, opt=opt, max_steps=max_steps)
     # Generate XYZ block
     try:
         xyz_block = Chem.MolToXYZBlock(mol)
@@ -216,8 +231,9 @@ def optimize_gpu_dft(smiles: str, max_cycle: int = 10, max_geom_steps: int = 25,
 
     try:
         mymol = create_gto_mol(smiles, add_hydrogen=add_hydrogen, basis_set='def2-tzvpp')
-
-        mf = rks.RKS(mymol)
+        
+        #mf = rks.RKS(mymol) DISABLED UNTIL GPU4PYSCF IS FIXED
+        mf = scf.RKS(mymol)
         mf.xc = 'lds, vwn'  # Fastest DFT functional
         mf.conv_tol = conv  # Looser convergence
         mf.max_cycle = max_cycle

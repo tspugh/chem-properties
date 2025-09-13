@@ -1,0 +1,5 @@
+{
+    "python.defaultInterpreter": "./.venv/bin/python3",
+    "python.pythonPath": "./.venv/bin/python3",
+    "pylsp.plugins.jedi.environment": "./.venv/bin/python3"
+}
