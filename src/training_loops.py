@@ -228,7 +228,7 @@ def composite_loss(monomer_index: int, properties: List[str], preds: torch.Tenso
         mask_present = torch.isfinite(t)
 
         if mask_present.any():
-            mse = F.mse_loss(p[mask_present], t[mask_present], weight=smiles_weight(related_info)[mask_present])
+            mse = F.mse_loss(p[mask_present], t[mask_present], weight=smiles_weight(monomer_index, related_info)[mask_present])
             loss_items.append(mse)
         # Range-violation for all (including available): no loss if within bounds
         rv = range_violation_loss(properties, p, j).mean()
@@ -246,7 +246,7 @@ def compute_mae_in_bounds(monomer_index: int, properties: List[str], preds: torc
         mask_present = torch.isfinite(t)
 
         if mask_present.any():
-            out[f"mae_{name}"] = (torch.mul(p[mask_present] - t[mask_present], smiles_weight(related_info)[mask_present])).abs().mean().item()
+            out[f"mae_{name}"] = (torch.mul(p[mask_present] - t[mask_present], smiles_weight(monomer_index, related_info)[mask_present])).abs().mean().item()
         else:
             out[f"mae_{name}"] = float("nan")
     return out
