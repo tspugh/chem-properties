@@ -225,7 +225,7 @@ def composite_loss(monomer_index: int, properties: List[str], preds: torch.Tenso
     for j in range(len(properties)):
         t = targets[:, j]
         p = preds[:, j]
-        mask_present = torch.isfinite(t).to(p.device)
+        mask_present = torch.isfinite(t).cpu()
 
         if mask_present.any():
             mse = F.mse_loss(p[mask_present], t[mask_present], weight=smiles_weight(monomer_index, related_info, device=p.device)[mask_present])
@@ -243,7 +243,7 @@ def compute_mae_in_bounds(monomer_index: int, properties: List[str], preds: torc
 
         t = targets[:, j]
         p = preds[:, j]
-        mask_present = torch.isfinite(t).to(p.device)
+        mask_present = torch.isfinite(t).cpu()
 
         if mask_present.any():
             out[f"mae_{name}"] = (torch.mul(p[mask_present] - t[mask_present], smiles_weight(monomer_index, related_info, device=p.device)[mask_present])).abs().mean().item()
