@@ -210,12 +210,12 @@ def range_violation_loss(properties: List[str], pred: torch.Tensor, prop_idx: in
     above = F.relu(pred - hi)
     return torch.pow(below + above, 2)
 
-def smiles_weight(monomer_index: int, aux_info: Union[List[np.ndarray], np.ndarray], weight_base: float = 0.33) -> torch.Tensor:
+def smiles_weight(monomer_index: int, aux_info: Union[List[np.ndarray], np.ndarray], device: torch.device, weight_base: float = 0.33) -> torch.Tensor:
 
     if isinstance(aux_info, list):
-        monomer_count = torch.tensor([aux_info[i][monomer_index] for i in range(len(aux_info))], dtype=torch.float32)
+        monomer_count = torch.tensor([aux_info[i][monomer_index] for i in range(len(aux_info))], dtype=torch.float32, device=device)
     else:
-        monomer_count = torch.tensor(aux_info[monomer_index], dtype=torch.float32)
+        monomer_count = torch.tensor(aux_info[monomer_index], dtype=torch.float32, device=device)
 
     return torch.pow(weight_base, monomer_count-1)
 
@@ -225,10 +225,10 @@ def composite_loss(monomer_index: int, properties: List[str], preds: torch.Tenso
     for j in range(len(properties)):
         t = targets[:, j]
         p = preds[:, j]
-        mask_present = torch.isfinite(t)
+        mask_present = torch.isfinite(t).to(p.device)
 
         if mask_present.any():
-            mse = F.mse_loss(p[mask_present], t[mask_present], weight=smiles_weight(monomer_index, related_info)[mask_present])
+            mse = F.mse_loss(p[mask_present], t[mask_present], weight=smiles_weight(monomer_index, related_info, device=p.device)[mask_present])
             loss_items.append(mse)
         # Range-violation for all (including available): no loss if within bounds
         rv = range_violation_loss(properties, p, j).mean()
@@ -243,10 +243,10 @@ def compute_mae_in_bounds(monomer_index: int, properties: List[str], preds: torc
 
         t = targets[:, j]
         p = preds[:, j]
-        mask_present = torch.isfinite(t)
+        mask_present = torch.isfinite(t).to(p.device)
 
         if mask_present.any():
-            out[f"mae_{name}"] = (torch.mul(p[mask_present] - t[mask_present], smiles_weight(monomer_index, related_info)[mask_present])).abs().mean().item()
+            out[f"mae_{name}"] = (torch.mul(p[mask_present] - t[mask_present], smiles_weight(monomer_index, related_info, device=p.device)[mask_present])).abs().mean().item()
         else:
             out[f"mae_{name}"] = float("nan")
     return out
