@@ -1303,7 +1303,7 @@ class KMeansHRMInnerModule(nn.Module):
         output = self.output_head(current_carry, current_carry.batch)
         q_logits = self.policy_module(current_carry, current_carry.batch).to(torch.float32)
         
-        return new_carry, output, (q_logits[..., 0], q_logits[..., 1])
+        return new_carry, output, (q_logits[0, ...], q_logits[1, ...])
 
 @dataclass
 class KMeansHRMInitialCarry:
@@ -1506,7 +1506,7 @@ class KMeansHRMModule(nn.Module):
 
                 # Generate target policy for training
                 target_q_logits = self.inner_module.policy_module(new_inner_carry, new_inner_carry.batch).to(torch.float32)
-                output['target_q_policy'] = (target_q_logits[..., 0], target_q_logits[..., 1])
+                output['target_q_policy'] = (target_q_logits[0, ...], target_q_logits[1, ...])
         
         return KMeansHRMInitialCarry(inner_carry=new_inner_carry, steps=new_steps, halted=halted, current_data=new_current_data), output
     
