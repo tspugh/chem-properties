@@ -76,7 +76,8 @@ class KMeansCarry(Data):
         node_mask = self.mask[:, mask_idx] > 0
         if node_mask.sum() == 0:
             return torch.empty(2, 0, dtype=torch.long, device=self.edge_index.device)
-        ei = subgraph(node_mask, self.edge_index)[0]
+        
+        ei = subgraph(torch.arange(self.edge_index.shape[1], device=self.edge_index.device)[node_mask], self.edge_index)[0]
         assert ei.dim() == 2 and ei.shape[0] == 2, (
             f"KMeansCarry.masked_edge_index: edge_index must be shape [2, E], got {tuple(ei.shape)}"
         )
@@ -1173,7 +1174,7 @@ class KMeansHRMInnerModule(nn.Module):
         
         return KMeansCarry(x=x, mask=mask, none_selected=none_selected, edge_index=edge_index, batch=batch)
     
-    def reset_carry(self, reset_flag: torch.Tensor, carry: KMeansCarry) -> KMeansCarry:
+    def reset_carry(self, reset_flag: torch.Tensor, carry: KMeansCarry, new_batch: Optional[Tensor] = None) -> KMeansCarry:
         """
         Reset KMeansCarry based on reset flags.
         
@@ -1192,17 +1193,27 @@ class KMeansHRMInnerModule(nn.Module):
             else:
                 return carry
         else:
-            # Batched case
-            new_x = carry.x.clone()
-            new_mask = carry.mask.clone()
-            new_none_selected = carry.none_selected.clone()
+            if new_batch is not None and new_batch.shape[0] != carry.batch.shape[0]:
+                max_batch = new_batch.max()
+                mask = carry.batch <= max_batch
+
+                new_batch = carry.batch.clone()[mask]
+                new_x = carry.x.clone()[mask]
+                new_mask = carry.mask.clone()[mask]
+                new_none_selected = carry.none_selected.clone()[mask]
+            else:
+                new_x = carry.x.clone()
+                new_mask = carry.mask.clone()
+                new_none_selected = carry.none_selected.clone()
+                new_batch = carry.batch.clone()
+
             
             # For each graph that needs reset, reinitialize its nodes and mask
-            unique_batches = torch.unique(carry.batch)
+            unique_batches = torch.unique(new_batch)
             for i, batch_idx in enumerate(unique_batches):
                 if i < len(reset_flag) and reset_flag[i]:
                     # Reset this graph
-                    batch_mask = (carry.batch == batch_idx)
+                    batch_mask = (new_batch == batch_idx)
                     num_nodes_in_graph = batch_mask.sum()
                     
                     # Reset features
@@ -1213,7 +1224,7 @@ class KMeansHRMInnerModule(nn.Module):
             return KMeansCarry(
                 x=new_x,
                 edge_index=carry.edge_index,
-                batch=carry.batch,
+                batch=new_batch,
                 mask=new_mask,
                 none_selected=new_none_selected,
                 edge_attr=carry.edge_attr if hasattr(carry, 'edge_attr') else None
@@ -1458,7 +1469,7 @@ class KMeansHRMModule(nn.Module):
         Returns:
             Tuple of (updated_carry, output)
         """
-        new_inner_carry = self.inner_module.reset_carry(carry.halted, carry.inner_carry)
+        new_inner_carry = self.inner_module.reset_carry(carry.halted, carry.inner_carry, data.batch)
         new_steps = torch.where(carry.halted, 0, carry.steps)
         
         # For PyTorch Geometric batches, we don't need complex filtering
