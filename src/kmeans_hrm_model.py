@@ -1484,10 +1484,7 @@ class KMeansHRMModule(nn.Module):
         new_current_data.batch = data.batch
         
         # Main run
-        old_inner_batch = new_inner_carry.batch
         new_inner_carry, y_pred, (q_halt, q_continue) = self.inner_module(new_inner_carry, new_current_data, new_current_data.batch)
-    
-        new_inner_carry.batch = old_inner_batch
 
         output = KMeansHRMOutput(
             y_pred=y_pred,
