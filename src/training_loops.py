@@ -1,7 +1,10 @@
 from __future__ import annotations
 
-from typing import Any, Callable, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Optional, Tuple, List, Union
 import math
+
+from torch.nn import functional as F
+import torch
 
 try:
     from torch_geometric.loader import DataLoader
@@ -9,6 +12,8 @@ except Exception:  # pragma: no cover
     DataLoader = Any  # type: ignore
 
 import torch
+
+PROPERTY_BOUNDS: Dict[str, Tuple[float, float]] = {}
 
 
 def train_until_total_iters(
@@ -183,8 +188,9 @@ def load_checkpoint(
 
     return state, state.get("train_state")  # type: ignore[return-value]
 
-def range_violation_loss(properties: List[str], pred: torch.Tensor, prop_idx: int) -> torch.Tensor:
-    PROPERTY_BOUNDS: Dict[str, Tuple[float, float]] = {}
+
+def init_property_bounds(properties: List[str], extended_df: pd.DataFrame) -> Dict[str, Tuple[float, float]]:
+    global PROPERTY_BOUNDS
     for prop in properties:
         values = extended_df[prop].dropna()
         if len(values) > 0:
@@ -195,7 +201,9 @@ def range_violation_loss(properties: List[str], pred: torch.Tensor, prop_idx: in
             # Fallback to a default range if no values are present
             PROPERTY_BOUNDS[prop] = (0.0, 1.0)
 
-    bounds_tensor = torch.tensor([PROPERTY_BOUNDS[p] for p in PROPERTIES], dtype=torch.float32, device=device)  # [5,2]
+def range_violation_loss(properties: List[str], pred: torch.Tensor, prop_idx: int) -> torch.Tensor:
+    global PROPERTY_BOUNDS
+    bounds_tensor = torch.tensor([PROPERTY_BOUNDS[p] for p in properties], dtype=torch.float32)  # [5,2]
 
     lo, hi = bounds_tensor[prop_idx, 0], bounds_tensor[prop_idx, 1]
     below = F.relu(lo - pred)
@@ -223,7 +231,7 @@ def composite_loss(monomer_index: int, properties: List[str], preds: torch.Tenso
             mse = F.mse_loss(p[mask_present], t[mask_present], weight=smiles_weight(related_info)[mask_present])
             loss_items.append(mse)
         # Range-violation for all (including available): no loss if within bounds
-        rv = range_violation_loss(p, j).mean()
+        rv = range_violation_loss(properties, p, j).mean()
         loss_items.append(rv)
     return torch.stack(loss_items).mean()
 

@@ -77,7 +77,7 @@ class KMeansCarry(Data):
         if node_mask.sum() == 0:
             return torch.empty(2, 0, dtype=torch.long, device=self.edge_index.device)
         
-        ei = subgraph(torch.arange(self.edge_index.shape[1], device=self.edge_index.device)[node_mask], self.edge_index)[0]
+        ei = subgraph(torch.arange(self.x.shape[0], device=self.x.device)[node_mask], self.edge_index)[0]
         assert ei.dim() == 2 and ei.shape[0] == 2, (
             f"KMeansCarry.masked_edge_index: edge_index must be shape [2, E], got {tuple(ei.shape)}"
         )
