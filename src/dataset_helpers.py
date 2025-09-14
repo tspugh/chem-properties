@@ -5,7 +5,9 @@ from torch_geometric.data import Data, Batch, Dataset
 from rdkit import Chem
 from functools import cache
 import os
-from typing import List, Optional
+from typing import List, Optional, Tuple
+import pandas as pd
+import numpy as np
 
 BOND_TENSOR_DICT = {
     Chem.BondType.SINGLE:torch.tensor([1,0,0,0]),
@@ -192,13 +194,13 @@ def create_edge_features(mol):
     return (edge_index, edge_attr)
 
 from opt_helpers import remove_asterisk
-def smiles_to_graph_data(smiles, output, use_position=False, continue_on_failure=False):
+def smiles_to_graph_data(smiles, output, aux_info: np.ndarray, use_position=False, continue_on_failure=False):
     mol = Chem.MolFromSmiles(remove_asterisk(smiles))
     if mol is None:
         raise ValueError(f"Invalid SMILES string: {smiles}")
 
     try:
-        node_features=create_node_features(mol, use_position=use_position, opt=use_position)
+        node_features = create_node_features(mol, use_position=use_position, opt=use_position)
     except Exception as e:
         print("Node features failed with error: ", e)
         if not continue_on_failure:
@@ -206,19 +208,24 @@ def smiles_to_graph_data(smiles, output, use_position=False, continue_on_failure
 
     edge_index, edge_attr = create_edge_features(mol)
     data = Data(
-        x = node_features,
-        edge_index = edge_index,
-        edge_attr = edge_attr,
-        y=output
+        x=node_features,
+        edge_index=edge_index,
+        edge_attr=edge_attr,
+        y=output,
+        aux_info=aux_info
     )
 
     return data
 
-def smiles_iter_to_graph_dataset(smiles_iter, y):
+def smiles_iter_to_graph_dataset(smiles_iter, y, aux_info: Optional[pd.DataFrame] = None):
     dataset = []
-    for smiles, output in zip(smiles_iter, y):
+    if aux_info is None:
+        aux_info = pd.DataFrame(index=smiles_iter)
+
+    for smiles, output, aux_info_piece in zip(smiles_iter, y, aux_info.to_numpy()):
         try:
-            dataset.append(smiles_to_graph_data(smiles, output))
+            data = smiles_to_graph_data(smiles, output, aux_info_piece)
+            dataset.append(data)
         except Exception as e:
             print("Failed for ", smiles, "with error: ", e)
             continue

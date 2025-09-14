@@ -201,7 +201,7 @@ def iterative_extend_smiles(
         counter += 1
         logger.debug(f"Extended {counter}/{len(visited)} structures")
 
-    def helper(current_smiles: str, depth_left: int) -> Generator[str, None, None]:
+    def helper(current_smiles: str, depth_left: int) -> Generator[Tuple[str, int], None, None]:
         if depth_left == 0:
             yield (safe_replace_asterisk_with_carbon(current_smiles), max_chain_extend)
             logger.debug(f"Yielding {safe_replace_asterisk_with_carbon(current_smiles)} with depth {max_chain_extend}, depth_left == 0")
@@ -270,5 +270,5 @@ def iterative_extend_smiles(
         visited.add(start)
 
     for result in helper(smiles, max_chain_extend):
-        yield result
+        yield (result[0], max_chain_extend - result[1] + 1)
     logger.debug(f"Extended {len(visited)-counter}/{len(visited)} structures")
