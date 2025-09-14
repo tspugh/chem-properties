@@ -5,6 +5,8 @@ import math
 
 from torch.nn import functional as F
 import torch
+import numpy as np
+import pandas as pd
 
 try:
     from torch_geometric.loader import DataLoader
@@ -222,20 +224,23 @@ def smiles_weight(monomer_index: int, aux_info: Union[List[np.ndarray], np.ndarr
 def composite_loss(monomer_index: int, properties: List[str], preds: torch.Tensor, targets: torch.Tensor, related_info: Union[List[np.ndarray], np.ndarray]) -> torch.Tensor:
     # preds: [B, 5], targets: [B, 5] with NaNs if missing
     loss_items = []
+
+    weight = smiles_weight(monomer_index, related_info, device=preds.device)
+
     for j in range(len(properties)):
         t = targets[:, j]
         p = preds[:, j]
         mask_present = torch.isfinite(t).to(p.device)
 
         assert p.device == t.device, f"p.device: {p.device}, t.device: {t.device}"
-        assert p.device == related_info.device, f"p.device: {p.device}, related_info.device: {related_info.device}"
+        assert p.device == weight.device, f"p.device: {p.device}, related_info.device: {weight.device}"
         assert mask_present.shape == p.shape, f"mask_present.shape: {mask_present.shape}, p.shape: {p.shape}"
         assert mask_present.shape == t.shape, f"mask_present.shape: {mask_present.shape}, t.shape: {t.shape}"
-        assert mask_present.shape == related_info.shape, f"mask_present.shape: {mask_present.shape}, related_info.shape: {related_info.shape}"
+        assert mask_present.shape == weight.shape, f"mask_present.shape: {mask_present.shape}, weight.shape: {weight.shape}"
 
 
         if mask_present.any():
-            mse = F.mse_loss(p[mask_present], t[mask_present], weight=smiles_weight(monomer_index, related_info, device=p.device)[mask_present])
+            mse = F.mse_loss(p[mask_present], t[mask_present], weight=weight[mask_present])
             loss_items.append(mse)
         # Range-violation for all (including available): no loss if within bounds
         rv = range_violation_loss(properties, p, j).mean()
@@ -246,6 +251,9 @@ def composite_loss(monomer_index: int, properties: List[str], preds: torch.Tenso
 @torch.no_grad()
 def compute_mae_in_bounds(monomer_index: int, properties: List[str], preds: torch.Tensor, targets: torch.Tensor, related_info: np.ndarray) -> Dict[str, float]:
     out = {}
+
+    weight=smiles_weight(monomer_index, related_info, device=preds.device)
+
     for j, name in enumerate(properties):
 
         t = targets[:, j]
@@ -253,13 +261,13 @@ def compute_mae_in_bounds(monomer_index: int, properties: List[str], preds: torc
         mask_present = torch.isfinite(t).to(p.device)
 
         assert p.device == t.device, f"p.device: {p.device}, t.device: {t.device}"
-        assert p.device == related_info.device, f"p.device: {p.device}, related_info.device: {related_info.device}"
+        assert p.device == related_info.device, f"p.device: {p.device}, related_info.device: {weight.device}"
         assert mask_present.shape == p.shape, f"mask_present.shape: {mask_present.shape}, p.shape: {p.shape}"
         assert mask_present.shape == t.shape, f"mask_present.shape: {mask_present.shape}, t.shape: {t.shape}"
-        assert mask_present.shape == related_info.shape, f"mask_present.shape: {mask_present.shape}, related_info.shape: {related_info.shape}"
+        assert mask_present.shape == related_info.shape, f"mask_present.shape: {mask_present.shape}, related_info.shape: {weight.shape}"
 
         if mask_present.any():
-            out[f"mae_{name}"] = (torch.mul(p[mask_present] - t[mask_present], smiles_weight(monomer_index, related_info, device=p.device)[mask_present])).abs().mean().item()
+            out[f"mae_{name}"] = (torch.mul(p[mask_present] - t[mask_present], weight[mask_present])).abs().mean().item()
         else:
             out[f"mae_{name}"] = float("nan")
     return out
