@@ -1508,7 +1508,7 @@ class KMeansHRMModule(nn.Module):
                 halted = halted & (new_steps >= min_halt_steps)
 
                 # Generate target policy for training
-                target_q_logits = self.inner_module.policy_module(new_inner_carry)
+                target_q_logits = self.inner_module.policy_module(new_inner_carry, new_inner_carry.batch).to(torch.float32)
                 output['target_q_policy'] = (target_q_logits[..., 0], target_q_logits[..., 1])
         
         return KMeansHRMInitialCarry(inner_carry=new_inner_carry, steps=new_steps, halted=halted, current_data=new_current_data), output
