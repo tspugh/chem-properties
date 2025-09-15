@@ -212,16 +212,16 @@ def range_violation_loss(properties: List[str], pred: torch.Tensor, prop_idx: in
     above = F.relu(pred - hi)
     return torch.pow(below + above, 2)
 
-def smiles_weight(monomer_index: int, aux_info: Union[List[np.ndarray], np.ndarray], device: torch.device, weight_base: float = 0.33) -> torch.Tensor:
+def smiles_weight(monomer_index: int, aux_info: Union[List[np.ndarray], torch.Tensor], device: torch.device, weight_base: float = 0.33) -> torch.Tensor:
 
     if isinstance(aux_info, list):
         monomer_count = torch.tensor([aux_info[i][monomer_index] for i in range(len(aux_info))], dtype=torch.float32, device=device)
     else:
-        monomer_count = torch.tensor(aux_info[monomer_index], dtype=torch.float32, device=device)
+        monomer_count = torch.tensor(aux_info[:, monomer_index], dtype=torch.float32, device=device)
 
     return torch.pow(weight_base, monomer_count-1)
 
-def composite_loss(monomer_index: int, properties: List[str], preds: torch.Tensor, targets: torch.Tensor, related_info: Union[List[np.ndarray], np.ndarray]) -> torch.Tensor:
+def composite_loss(monomer_index: int, properties: List[str], preds: torch.Tensor, targets: torch.Tensor, related_info: Union[List[np.ndarray], torch.Tensor]) -> torch.Tensor:
     # preds: [B, 5], targets: [B, 5] with NaNs if missing
     loss_items = []
 
@@ -249,7 +249,7 @@ def composite_loss(monomer_index: int, properties: List[str], preds: torch.Tenso
 
 
 @torch.no_grad()
-def compute_mae_in_bounds(monomer_index: int, properties: List[str], preds: torch.Tensor, targets: torch.Tensor, related_info: np.ndarray) -> Dict[str, float]:
+def compute_mae_in_bounds(monomer_index: int, properties: List[str], preds: torch.Tensor, targets: torch.Tensor, related_info: Union[List[np.ndarray], torch.Tensor]) -> Dict[str, float]:
     out = {}
 
     weight=smiles_weight(monomer_index, related_info, device=preds.device)
@@ -259,9 +259,9 @@ def compute_mae_in_bounds(monomer_index: int, properties: List[str], preds: torc
         t = targets[:, j]
         p = preds[:, j]
         mask_present = torch.isfinite(t).to(p.device)
-    
+
         assert p.device == t.device, f"p.device: {p.device}, t.device: {t.device}"
-        assert p.device == weight.device, f"p.device: {p.device}, related_info.device: {weight.device}"
+        assert p.device == weight.device, f"p.device: {p.device}, weight.device: {weight.device}"
         assert mask_present.shape == p.shape, f"mask_present.shape: {mask_present.shape}, p.shape: {p.shape}"
         assert mask_present.shape == t.shape, f"mask_present.shape: {mask_present.shape}, t.shape: {t.shape}"
         assert mask_present.shape == weight.shape, f"mask_present.shape: {mask_present.shape}, weight.shape: {weight.shape}"
