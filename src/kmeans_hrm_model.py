@@ -1303,7 +1303,7 @@ class KMeansHRMInnerModule(nn.Module):
         output = self.output_head(current_carry, current_carry.batch)
         q_logits = self.policy_module(current_carry, current_carry.batch).to(torch.float32)
         
-        return new_carry, output, (q_logits[0, ...], q_logits[1, ...])
+        return new_carry, output, (q_logits[:, 0], q_logits[:, 1])
 
 @dataclass
 class KMeansHRMInitialCarry:
@@ -1470,7 +1470,19 @@ class KMeansHRMModule(nn.Module):
             Tuple of (updated_carry, output)
         """
         new_inner_carry = self.inner_module.reset_carry(carry.halted, carry.inner_carry, data.batch)
-        new_steps = torch.where(carry.halted, 0, carry.steps)
+
+        # Align step/halting tensors to current batch's number of graphs
+        if hasattr(data, 'num_graphs'):
+            expected_graphs = data.num_graphs
+        else:
+            expected_graphs = int(torch.max(data.batch).item()) + 1 if hasattr(data, 'batch') and data.batch is not None else 1
+
+        if carry.steps.numel() != expected_graphs or carry.halted.numel() != expected_graphs:
+            new_steps = torch.zeros(expected_graphs, dtype=torch.int32, device=data.batch.device if hasattr(data, 'batch') else carry.steps.device)
+            halted = torch.zeros(expected_graphs, dtype=torch.bool, device=data.batch.device if hasattr(data, 'batch') else carry.halted.device)
+        else:
+            new_steps = torch.where(carry.halted, 0, carry.steps)
+            halted = carry.halted.clone()
         
         # For PyTorch Geometric batches, we don't need complex filtering
         # as halted/reset is handled at the graph level in reset_carry
@@ -1499,6 +1511,11 @@ class KMeansHRMModule(nn.Module):
             halted = is_last_step
 
             if self.training and self.halt_max_steps > 0:
+                # Ensure halting tensors align to policy output length
+                if halted.numel() != q_halt.numel():
+                    new_steps = torch.zeros_like(q_halt, dtype=torch.int32)
+                    halted = torch.zeros_like(q_halt, dtype=torch.bool)
+
                 halted = halted | (q_halt > q_continue)
 
                 min_halt_steps = (torch.rand_like(q_halt) < self.explore_steps_prob) * torch.randint_like(new_steps, low=2, high=self.halt_max_steps)
@@ -1506,7 +1523,7 @@ class KMeansHRMModule(nn.Module):
 
                 # Generate target policy for training
                 target_q_logits = self.inner_module.policy_module(new_inner_carry, new_inner_carry.batch).to(torch.float32)
-                output['target_q_policy'] = (target_q_logits[0, ...], target_q_logits[1, ...])
+                output['target_q_policy'] = (target_q_logits[:, 0], target_q_logits[:, 1])
         
         return KMeansHRMInitialCarry(inner_carry=new_inner_carry, steps=new_steps, halted=halted, current_data=new_current_data), output
     

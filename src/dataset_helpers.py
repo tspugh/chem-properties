@@ -194,7 +194,7 @@ def create_edge_features(mol):
     return (edge_index, edge_attr)
 
 from opt_helpers import remove_asterisk
-def smiles_to_graph_data(smiles, output, aux_info: np.ndarray, use_position=False, continue_on_failure=False):
+def smiles_to_graph_data(smiles, output: Optional[float], aux_info: Optional[np.ndarray], use_position=False, continue_on_failure=False):
     mol = Chem.MolFromSmiles(remove_asterisk(smiles))
     if mol is None:
         raise ValueError(f"Invalid SMILES string: {smiles}")
